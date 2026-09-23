@@ -266,6 +266,11 @@ and `~/.local/bin/herdr-space-colors`. Runtime state lives under
   [#1](https://github.com/ferretorres/herdr-plugin-space-colors/issues/1).
 - Built and tested on macOS with herdr 0.8.2. Linux is declared and expected
   to work; reports welcome.
+- The Spaces sidebar header's padding is herdr core's layout, not this
+  plugin's. Raised upstream in
+  [herdrdev/herdr discussion #4530](https://github.com/herdrdev/herdr/discussions/4530);
+  tracked here in
+  [#7](https://github.com/ferretorres/herdr-plugin-space-colors/issues/7).
 
 ## Contributing
 
