@@ -3,6 +3,53 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.4] - 2026-11-26
+
+### Fixed
+
+- Several herdr sessions at once. Each session runs its own server, but all
+  share the plugin state dir, and workspace and pane ids (`w1`, `w1:p1`)
+  repeat in every session. The sidebar tag caches were shared, so a sweep in
+  one session could prune another's entries or mark a tag as already in
+  place in a session where it was never written. The caches now live in one
+  `state-<key>.json` per session, keyed by a hash of `HERDR_SOCKET_PATH`;
+  `state.json` keeps only what belongs to the shared `config.toml` and the
+  window tint. The old shared caches are ignored and dropped on the next
+  save (one redundant tag write per pane and Space, once).
+- Startup in several sessions at once no longer skips the theme. A held lock
+  is retried with backoff for up to three seconds instead of printing
+  "another apply is running; skipped". The theme write keeps a global lock,
+  since `config.toml` is shared; sidebar tags take a per-session lock.
+- Sidebar tags come back after a server restart. herdr restores the same ids
+  without their reported tokens, so the cache is now dropped when the
+  session's server instance changes.
+- Sidebar rows replaced after the plugin wrote them are left alone. Once
+  written, `agents`/`spaces` rows were treated as the plugin's forever, so
+  rows set later by the user or another tool (for example a kit with its own
+  `[ui.sidebar.agents]` rows) were overwritten on the next focus and deleted
+  by `clear`. The plugin now records a fingerprint of the rows it wrote; rows
+  that no longer match are released with a one-time "rows were changed by
+  someone else; leaving them alone" and never rewritten or removed. Rows
+  recorded by 0.3.3 without a fingerprint stay managed when they have the
+  shape the plugin generates (`state_icon`, only `$sc_*` token tables, then
+  its fixed builtins), whatever palettes they came from; rows with any other
+  token, such as `$crew_top_*`, are released. The fingerprint is saved right
+  after the config write, before the window tint, so a failing tint cannot
+  leave the plugin's own rows looking foreign. Pane and Space tokens are
+  still reported either way, so other rows can keep using `$sc_<palette>`.
+
+- herdr's config, the plugin config dir and the state dir now follow
+  `XDG_CONFIG_HOME` / `XDG_STATE_HOME` like herdr does when no explicit path
+  is given. With only `XDG_CONFIG_HOME` set, `apply` failed reading
+  `~/.config/herdr/config.toml`, and the CLI looked for the plugin config
+  outside herdr's config dir. An empty XDG value counts as unset.
+
+### Changed
+
+- `status` shows the session, its socket and its state file. `clear` drops
+  only the calling session's tags; the shared theme and rows are restored
+  for all sessions as before.
+
 ## [0.3.3] - 2026-09-08
 
 ### Added

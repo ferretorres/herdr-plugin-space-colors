@@ -23,12 +23,12 @@
 //!   * `herdr config check` after every write; failure restores the old bytes
 //!   * `clear` removes exactly what this plugin wrote and nothing else
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value as TomlValue};
@@ -42,6 +42,8 @@ const TOKEN_PREFIX: &str = "sc_";
 const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 const BACKUP_SUFFIX: &str = ".space-colors.bak";
 const LOCK_STALE: Duration = Duration::from_secs(15);
+/// How long a command waits for a lock held by another invocation.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 const HOOK_MARKER: &str = "# herdr-space-colors shell hook";
 
 /// `theme.custom.*` tokens accepted by herdr 0.8.2. `herdr config check` does
@@ -180,7 +182,7 @@ Usage:
 
 Plugin config: $HERDR_PLUGIN_CONFIG_DIR/config.toml  (seeded on first run)
 Herdr config:  $HERDR_CONFIG_PATH, else `herdr_config` in the plugin config,
-               else ~/.config/herdr/config.toml
+               else ${{XDG_CONFIG_HOME:-~/.config}}/herdr/config.toml
 Backup:        <herdr config>{BACKUP_SUFFIX}, written once before the first edit
 ")
 }
@@ -205,14 +207,11 @@ fn ctx() -> Ctx {
     // where herdr keeps them so both paths agree.
     let config_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config/herdr/plugins/config").join(PLUGIN_ID));
+        .unwrap_or_else(|| herdr_config_dir().join("plugins/config").join(PLUGIN_ID));
     // herdr keeps plugin state under the XDG state dir, not beside the config.
-    let state_root = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"));
     let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| state_root.join("herdr/plugins").join(PLUGIN_ID));
+        .unwrap_or_else(|| herdr_state_dir().join("plugins").join(PLUGIN_ID));
     Ctx {
         herdr,
         config_dir,
@@ -227,7 +226,33 @@ fn herdr_config_path(cfg: &PluginConfig) -> PathBuf {
     if let Some(p) = &cfg.herdr_config {
         return expand_home(p);
     }
-    home().join(".config/herdr/config.toml")
+    herdr_config_dir().join("config.toml")
+}
+
+/// herdr's directory rule: `$XDG_*_HOME/herdr` when set, else
+/// `$HOME/<home_rel>/herdr`. An empty XDG value counts as unset, per the XDG
+/// spec (herdr itself would resolve it to a relative `herdr`).
+fn herdr_dir(xdg: Option<&std::ffi::OsStr>, home: &Path, home_rel: &str) -> PathBuf {
+    match xdg.filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base).join("herdr"),
+        None => home.join(home_rel).join("herdr"),
+    }
+}
+
+fn herdr_config_dir() -> PathBuf {
+    herdr_dir(
+        env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &home(),
+        ".config",
+    )
+}
+
+fn herdr_state_dir() -> PathBuf {
+    herdr_dir(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        &home(),
+        ".local/state",
+    )
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -551,19 +576,105 @@ fn is_hex_colour(s: &str) -> bool {
 
 // --- state ----------------------------------------------------------------------
 
+/// State tied to the shared herdr `config.toml` and to terminal windows. One
+/// copy for every session, guarded by `apply.lock`.
 #[derive(Default)]
 struct State {
     managed: Vec<String>,
-    managed_sidebar: Vec<String>,
+    /// Sidebar kind → canonical form of the rows last written there. An empty
+    /// fingerprint comes from a version that did not record one.
+    managed_sidebar: BTreeMap<String, String>,
+    window: window::WindowState,
+}
+
+/// State keyed by herdr ids. Each session runs its own server with its own id
+/// space (`w1`, `w1:p1` exist in every session) while plugin state is shared,
+/// so these live in one file per session, guarded by that session's lock.
+#[derive(Default, Debug, PartialEq)]
+struct SessionState {
     pane_tokens: BTreeMap<String, String>,
     ws_tokens: BTreeMap<String, String>,
     last_workspace: Option<String>,
     last_palette: Option<String>,
-    window: window::WindowState,
+    /// Identity of the server the caches were written against.
+    server: Option<String>,
+}
+
+impl SessionState {
+    /// Reported tokens live in the server's memory only: a restarted server
+    /// restores the same ids without their tokens, so caches written against
+    /// another server instance are void.
+    fn adopt_server(&mut self, server: Option<&str>) {
+        if self.server.as_deref() != server {
+            self.ws_tokens.clear();
+            self.pane_tokens.clear();
+            self.server = server.map(str::to_owned);
+        }
+    }
+}
+
+/// The herdr server a command talks to.
+struct Session {
+    name: String,
+    socket: Option<String>,
+    key: String,
+    /// The socket file's inode and mtime; a server start creates a new socket.
+    server: Option<String>,
+}
+
+fn server_stamp(socket: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = fs::metadata(socket).ok()?;
+    Some(format!("{}:{}:{}", m.ino(), m.mtime(), m.mtime_nsec()))
+}
+
+/// File-name-safe key for a session. The socket path identifies the server;
+/// the name is the fallback when no socket is known.
+fn session_key(socket: Option<&str>, name: &str) -> String {
+    let seed = match socket {
+        Some(s) => format!("socket:{s}"),
+        None => format!("session:{name}"),
+    };
+    format!("{:016x}", fnv1a(&seed))
+}
+
+/// herdr sets `HERDR_SOCKET_PATH` for plugin commands. From a plain shell the
+/// socket is looked up by session name, so the CLI and the hooks agree on the
+/// key.
+fn current_session(ctx: &Ctx) -> Session {
+    let name = window::current_session();
+    let socket = env::var("HERDR_SOCKET_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| lookup_socket(ctx, &name));
+    Session {
+        key: session_key(socket.as_deref(), &name),
+        server: socket.as_deref().and_then(|s| server_stamp(Path::new(s))),
+        name,
+        socket,
+    }
+}
+
+fn lookup_socket(ctx: &Ctx, name: &str) -> Option<String> {
+    let v = herdr_json(ctx, &["session", "list", "--json"]).ok()?;
+    v["sessions"]
+        .as_array()?
+        .iter()
+        .find(|s| s["name"].as_str() == Some(name))
+        .and_then(|s| s["socket_path"].as_str())
+        .map(str::to_owned)
 }
 
 fn state_path(ctx: &Ctx) -> PathBuf {
     ctx.state_dir.join("state.json")
+}
+
+fn session_state_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("state-{key}.json"))
+}
+
+fn session_lock_name(key: &str) -> String {
+    format!("apply-{key}.lock")
 }
 
 fn str_vec(v: &Value) -> Vec<String> {
@@ -587,20 +698,26 @@ fn str_map(v: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Up to 0.3.3 `state.json` also held the id caches of whichever session wrote
+/// last. Those keys are ignored here and dropped on the next save; the cost is
+/// one redundant report per pane and Space on the first sweep.
 fn load_state(ctx: &Ctx) -> State {
-    let Ok(text) = fs::read_to_string(state_path(ctx)) else {
-        return State::default();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+    let Some(v) = read_json(&state_path(ctx)) else {
         return State::default();
     };
     State {
         managed: str_vec(&v["managed"]),
-        managed_sidebar: str_vec(&v["managed_sidebar"]),
-        pane_tokens: str_map(&v["pane_tokens"]),
-        ws_tokens: str_map(&v["ws_tokens"]),
-        last_workspace: v["last_workspace"].as_str().map(str::to_owned),
-        last_palette: v["last_palette"].as_str().map(str::to_owned),
+        managed_sidebar: match v["sidebar_rows"].as_object() {
+            Some(_) => str_map(&v["sidebar_rows"]),
+            None => str_vec(&v["managed_sidebar"])
+                .into_iter()
+                .map(|k| (k, String::new()))
+                .collect(),
+        },
         window: window::WindowState {
             original: str_map(&v["window_original"]),
             current: str_map(&v["window_current"]),
@@ -609,26 +726,59 @@ fn load_state(ctx: &Ctx) -> State {
     }
 }
 
+fn write_state_file(dir: &Path, path: &Path, v: &Value) -> Res<()> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    fs::write(path, serde_json::to_string_pretty(v).unwrap())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 fn save_state(ctx: &Ctx, st: &State) -> Res<()> {
-    fs::create_dir_all(&ctx.state_dir)
-        .map_err(|e| format!("create {}: {e}", ctx.state_dir.display()))?;
     let v = serde_json::json!({
         "managed": st.managed,
-        "managed_sidebar": st.managed_sidebar,
-        "pane_tokens": st.pane_tokens,
-        "ws_tokens": st.ws_tokens,
-        "last_workspace": st.last_workspace,
-        "last_palette": st.last_palette,
+        "sidebar_rows": st.managed_sidebar,
+        "managed_sidebar": st.managed_sidebar.keys().collect::<Vec<_>>(),
         "window_original": st.window.original,
         "window_current": st.window.current,
         "window_session": st.window.session,
     });
-    fs::write(state_path(ctx), serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("write state: {e}"))
+    write_state_file(&ctx.state_dir, &state_path(ctx), &v)
 }
 
-/// One writer at a time. `workspace.focused` can fire in bursts; the second
-/// invocation must not race the first over config.toml.
+fn read_session_state(dir: &Path, key: &str) -> SessionState {
+    let Some(v) = read_json(&session_state_path(dir, key)) else {
+        return SessionState::default();
+    };
+    SessionState {
+        pane_tokens: str_map(&v["pane_tokens"]),
+        ws_tokens: str_map(&v["ws_tokens"]),
+        last_workspace: v["last_workspace"].as_str().map(str::to_owned),
+        last_palette: v["last_palette"].as_str().map(str::to_owned),
+        server: v["server"].as_str().map(str::to_owned),
+    }
+}
+
+fn load_session_state(dir: &Path, session: &Session) -> SessionState {
+    let mut st = read_session_state(dir, &session.key);
+    st.adopt_server(session.server.as_deref());
+    st
+}
+
+fn save_session_state(dir: &Path, session: &Session, st: &SessionState) -> Res<()> {
+    let v = serde_json::json!({
+        "session": session.name,
+        "socket": session.socket,
+        "pane_tokens": st.pane_tokens,
+        "ws_tokens": st.ws_tokens,
+        "last_workspace": st.last_workspace,
+        "last_palette": st.last_palette,
+        "server": st.server,
+    });
+    write_state_file(dir, &session_state_path(dir, &session.key), &v)
+}
+
+/// One writer at a time. `workspace.focused` can fire in bursts, and several
+/// herdr sessions start (and run their startup `apply`) at the same moment, so
+/// a second invocation waits for the first instead of racing it.
 struct Lock(PathBuf);
 
 impl Drop for Lock {
@@ -637,32 +787,47 @@ impl Drop for Lock {
     }
 }
 
-fn acquire_lock(ctx: &Ctx) -> Res<Option<Lock>> {
-    fs::create_dir_all(&ctx.state_dir)
-        .map_err(|e| format!("create {}: {e}", ctx.state_dir.display()))?;
-    let path = ctx.state_dir.join("apply.lock");
-    for _ in 0..2 {
+fn acquire_lock(dir: &Path, name: &str) -> Res<Option<Lock>> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    acquire_lock_at(&dir.join(name), LOCK_WAIT)
+}
+
+/// Take the lock file at `path`, retrying with backoff for up to `wait`.
+/// `None` means another holder kept it for the whole wait. A lock older than
+/// `LOCK_STALE` belongs to a process that died and is taken over.
+fn acquire_lock_at(path: &Path, wait: Duration) -> Res<Option<Lock>> {
+    let deadline = Instant::now() + wait;
+    let mut backoff = Duration::from_millis(20);
+    loop {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(path)
         {
-            Ok(_) => return Ok(Some(Lock(path))),
+            Ok(_) => return Ok(Some(Lock(path.to_owned()))),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
+                let stale = fs::metadata(path)
                     .and_then(|m| m.modified())
                     .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() > LOCK_STALE)
-                    .unwrap_or(true);
+                    .unwrap_or(false);
+                // ponytail: two waiters that both see a stale lock can race
+                // here (the second removes the first's fresh lock). It needs
+                // a holder dead for LOCK_STALE and two takeovers within the
+                // same instant; an flock-based lock would close it.
                 if stale {
-                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(path);
                     continue;
                 }
-                return Ok(None);
             }
             Err(e) => return Err(format!("lock {}: {e}", path.display())),
         }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = (backoff * 2).min(Duration::from_millis(250));
     }
-    Ok(None)
 }
 
 // --- herdr ----------------------------------------------------------------------
@@ -1099,6 +1264,102 @@ fn apply_sidebar(
     Ok(managed)
 }
 
+/// Formatting-independent form of a TOML value, for comparing rows.
+fn canon(v: &TomlValue) -> String {
+    match v {
+        TomlValue::String(s) => format!("{:?}", s.value()),
+        TomlValue::Array(a) => format!("[{}]", a.iter().map(canon).collect::<Vec<_>>().join(",")),
+        TomlValue::InlineTable(t) => {
+            let mut kv: Vec<String> = t.iter().map(|(k, v)| format!("{k}={}", canon(v))).collect();
+            kv.sort();
+            format!("{{{}}}", kv.join(","))
+        }
+        other => other.clone().decorated("", "").to_string(),
+    }
+}
+
+fn rows_item<'a>(doc: &'a DocumentMut, kind: &str) -> Option<&'a Item> {
+    doc.get("ui")
+        .and_then(Item::as_table_like)
+        .and_then(|u| u.get("sidebar"))
+        .and_then(Item::as_table_like)
+        .and_then(|s| s.get(kind))
+        .and_then(Item::as_table_like)
+        .and_then(|k| k.get("rows"))
+}
+
+/// Whether `rows` have the shape `build_rows` has produced since 0.2.0, with
+/// any palettes and colours: `state_icon`, then only `$sc_*` token tables,
+/// then the fixed builtins. Rows carrying anything else are someone else's.
+fn looks_generated(rows: &Item, kind: &str) -> bool {
+    let builtin = |v: &TomlValue, name: &str| v.as_str() == Some(name);
+    let sc_token = |v: &TomlValue| {
+        v.as_inline_table().is_some_and(|t| {
+            t.len() == 3
+                && t.get("token")
+                    .and_then(TomlValue::as_str)
+                    .is_some_and(|s| s.starts_with(&format!("${TOKEN_PREFIX}")))
+                && t.get("fg")
+                    .and_then(TomlValue::as_str)
+                    .is_some_and(is_hex_colour)
+                && t.get("bold").and_then(TomlValue::as_bool) == Some(true)
+        })
+    };
+    let (tail, second): (&[&str], &[&str]) = if kind == "agents" {
+        (&["workspace", "tab"], &["agent"])
+    } else {
+        (&["workspace"], &["branch", "git_status"])
+    };
+    let Some(rows) = rows.as_array() else {
+        return false;
+    };
+    let rows: Vec<&TomlValue> = rows.iter().collect();
+    let [TomlValue::Array(first), TomlValue::Array(last)] = rows.as_slice() else {
+        return false;
+    };
+    let first: Vec<&TomlValue> = first.iter().collect();
+    let Some((head, rest)) = first.split_first() else {
+        return false;
+    };
+    let Some(split) = rest.len().checked_sub(tail.len()) else {
+        return false;
+    };
+    let (tokens, end) = rest.split_at(split);
+    builtin(head, "state_icon")
+        && tokens.iter().all(|v| sc_token(v))
+        && end.iter().zip(tail).all(|(v, n)| builtin(v, n))
+        && last.len() == second.len()
+        && last.iter().zip(second).all(|(v, n)| builtin(v, n))
+}
+
+fn rows_canon(doc: &DocumentMut, kind: &str) -> Option<String> {
+    let item = rows_item(doc, kind)?;
+    Some(
+        item.as_value()
+            .map(canon)
+            .unwrap_or_else(|| item.to_string()),
+    )
+}
+
+/// Splits the managed kinds into those whose rows are still exactly what this
+/// plugin wrote (or absent) and those someone else has replaced since. Rows
+/// recorded without a fingerprint (0.3.3 and earlier) count as ours when they
+/// have the generated shape, whatever palettes they were generated from.
+fn owned_sidebar(
+    doc: &DocumentMut,
+    managed: &BTreeMap<String, String>,
+) -> (Vec<String>, Vec<String>) {
+    managed.keys().cloned().partition(|kind| {
+        let Some(item) = rows_item(doc, kind) else {
+            return true;
+        };
+        match managed[kind].as_str() {
+            "" => looks_generated(item, kind),
+            written => rows_canon(doc, kind).as_deref() == Some(written),
+        }
+    })
+}
+
 fn clear_sidebar(doc: &mut DocumentMut, managed: &[String]) {
     for kind in managed {
         let Some(sidebar) = doc
@@ -1144,12 +1405,20 @@ struct Plan<'a> {
     theme: Option<&'a Tokens>,
     previously_managed: &'a [String],
     sidebar: Option<&'a SidebarSpec>,
-    managed_sidebar: &'a [String],
+    managed_sidebar: &'a BTreeMap<String, String>,
+}
+
+struct Planned {
+    text: String,
+    managed_sidebar: BTreeMap<String, String>,
+    /// Kinds whose rows were changed by someone else and are no longer ours.
+    released: Vec<String>,
 }
 
 /// Full apply: theme tokens (or their removal when `theme` is None) plus
-/// sidebar rows. Returns the new text and the sidebar kinds now managed.
-fn plan_full(original: &str, plan: &Plan) -> Res<(String, Vec<String>)> {
+/// sidebar rows. Rows replaced by someone else since the last write are left
+/// alone and released.
+fn plan_full(original: &str, plan: &Plan) -> Res<Planned> {
     let mut doc: DocumentMut = original
         .parse()
         .map_err(|e| format!("herdr config parse error: {e}"))?;
@@ -1157,15 +1426,32 @@ fn plan_full(original: &str, plan: &Plan) -> Res<(String, Vec<String>)> {
         Some(tokens) => apply_theme(&mut doc, tokens, plan.previously_managed)?,
         None => clear_theme(&mut doc, plan.previously_managed),
     }
+    let (owned, released) = owned_sidebar(&doc, plan.managed_sidebar);
     let managed_sidebar = match plan.sidebar {
-        Some(spec) => apply_sidebar(&mut doc, spec, plan.managed_sidebar)?,
+        Some(spec) => apply_sidebar(&mut doc, spec, &owned)?
+            .into_iter()
+            .map(|kind| {
+                let fp = rows_canon(&doc, &kind).unwrap_or_default();
+                (kind, fp)
+            })
+            .collect(),
         None => {
-            clear_sidebar(&mut doc, plan.managed_sidebar);
-            Vec::new()
+            clear_sidebar(&mut doc, &owned);
+            BTreeMap::new()
         }
     };
     tidy_theme(&mut doc);
-    Ok((doc.to_string(), managed_sidebar))
+    Ok(Planned {
+        text: doc.to_string(),
+        managed_sidebar,
+        released,
+    })
+}
+
+fn report_released(released: &[String]) {
+    for kind in released {
+        outln!("[{TAG}] sidebar {kind} rows were changed by someone else; leaving them alone");
+    }
 }
 
 #[cfg(test)]
@@ -1174,19 +1460,23 @@ fn plan_apply(original: &str, tokens: &Tokens, previously_managed: &[String]) ->
         theme: Some(tokens),
         previously_managed,
         sidebar: None,
-        managed_sidebar: &[],
+        managed_sidebar: &BTreeMap::new(),
     };
-    plan_full(original, &plan).map(|(s, _)| s)
+    plan_full(original, &plan).map(|p| p.text)
 }
 
-fn plan_clear(original: &str, managed: &[String], managed_sidebar: &[String]) -> Res<String> {
+fn plan_clear(
+    original: &str,
+    managed: &[String],
+    managed_sidebar: &BTreeMap<String, String>,
+) -> Res<Planned> {
     let plan = Plan {
         theme: None,
         previously_managed: managed,
         sidebar: None,
         managed_sidebar,
     };
-    plan_full(original, &plan).map(|(s, _)| s)
+    plan_full(original, &plan)
 }
 
 // --- commit ---------------------------------------------------------------------
@@ -1324,60 +1614,55 @@ fn report_args<'a>(
     args
 }
 
+/// Entities whose wanted colour differs from what `cache` says is reported.
+/// Cache entries for ids that are no longer live are dropped first. The cache
+/// must belong to the session whose ids `want` holds.
+fn stale_tags(
+    cache: &mut BTreeMap<String, String>,
+    want: &BTreeMap<String, (Option<String>, Via)>,
+) -> Vec<(String, Option<String>)> {
+    cache.retain(|k, _| want.contains_key(k));
+    want.iter()
+        .filter(|(id, (palette, _))| {
+            cache.get(*id).map(String::as_str) != Some(palette.as_deref().unwrap_or_default())
+        })
+        .map(|(id, (palette, _))| (id.clone(), palette.clone()))
+        .collect()
+}
+
 /// Report one colour token per pane and workspace, clearing the others. Only
 /// entities whose colour changed since the last sweep cost a herdr call.
-fn sweep(ctx: &Ctx, cfg: &PluginConfig, st: &mut State, dry_run: bool) -> Res<usize> {
+fn sweep(ctx: &Ctx, cfg: &PluginConfig, st: &mut SessionState, dry_run: bool) -> Res<usize> {
     let workspaces = all_workspaces(ctx)?;
     let panes = all_panes(ctx)?;
     let a = assign(cfg, &workspaces, &panes);
     let all: Vec<String> = cfg.palettes.keys().cloned().collect();
     let mut calls = 0;
 
-    let live_ws: BTreeSet<&String> = a.ws_palette.keys().collect();
-    st.ws_tokens.retain(|k, _| live_ws.contains(k));
-    for (id, (palette, _)) in &a.ws_palette {
-        let want = palette.clone().unwrap_or_default();
-        if st.ws_tokens.get(id) == Some(&want) {
-            continue;
+    for (kind, cache, want) in [
+        ("workspace", &mut st.ws_tokens, &a.ws_palette),
+        ("pane", &mut st.pane_tokens, &a.pane_palette),
+    ] {
+        for (id, palette) in stale_tags(cache, want) {
+            let shown = palette.clone().unwrap_or_default();
+            if dry_run {
+                outln!(
+                    "[{TAG}] would tag {kind} {id} → {}",
+                    if shown.is_empty() { "none" } else { &shown }
+                );
+            } else {
+                let args = report_args(kind, &id, palette.as_deref(), &cfg.marker, &all);
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                herdr_run(ctx, &refs)?;
+                cache.insert(id, shown);
+            }
+            calls += 1;
         }
-        let args = report_args("workspace", id, palette.as_deref(), &cfg.marker, &all);
-        if dry_run {
-            outln!(
-                "[{TAG}] would tag workspace {id} → {}",
-                if want.is_empty() { "none" } else { &want }
-            );
-        } else {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            herdr_run(ctx, &refs)?;
-            st.ws_tokens.insert(id.clone(), want);
-        }
-        calls += 1;
-    }
-
-    let live_panes: BTreeSet<&String> = a.pane_palette.keys().collect();
-    st.pane_tokens.retain(|k, _| live_panes.contains(k));
-    for (id, (palette, _)) in &a.pane_palette {
-        let want = palette.clone().unwrap_or_default();
-        if st.pane_tokens.get(id) == Some(&want) {
-            continue;
-        }
-        let args = report_args("pane", id, palette.as_deref(), &cfg.marker, &all);
-        if dry_run {
-            outln!(
-                "[{TAG}] would tag pane {id} → {}",
-                if want.is_empty() { "none" } else { &want }
-            );
-        } else {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            herdr_run(ctx, &refs)?;
-            st.pane_tokens.insert(id.clone(), want);
-        }
-        calls += 1;
     }
     Ok(calls)
 }
 
-fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &State) -> Res<()> {
+fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &SessionState) -> Res<()> {
     let all: Vec<String> = cfg.palettes.keys().cloned().collect();
     for id in st.ws_tokens.keys() {
         let args = report_args("workspace", id, None, &cfg.marker, &all);
@@ -1406,14 +1691,101 @@ fn sidebar_spec(cfg: &PluginConfig, light: bool) -> Option<SidebarSpec> {
 
 // --- commands -------------------------------------------------------------------
 
+/// Theme and window tint for `ws`. Caller holds `apply.lock`.
+fn apply_shared(
+    ctx: &Ctx,
+    cfg: &PluginConfig,
+    ws: &Workspace,
+    palette_name: Option<&str>,
+    how: &str,
+    dry_run: bool,
+) -> Res<()> {
+    let mut st = load_state(ctx);
+
+    let path = herdr_config_path(cfg);
+    let original =
+        fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let doc: DocumentMut = original
+        .parse()
+        .map_err(|e| format!("herdr config parse error: {e}"))?;
+    let light = theme_mode(&doc) == ThemeMode::Light;
+
+    let tokens = palette_name.map(|n| cfg.palettes[n].effective(light));
+    let spec = sidebar_spec(cfg, light);
+    let plan = Plan {
+        theme: tokens.as_ref(),
+        previously_managed: &st.managed,
+        sidebar: spec.as_ref(),
+        managed_sidebar: &st.managed_sidebar,
+    };
+    let Planned {
+        text: updated,
+        managed_sidebar,
+        released,
+    } = plan_full(&original, &plan)?;
+    report_released(&released);
+    let what = match palette_name {
+        Some(n) => format!("{} → {n} ({how})", ws.label),
+        None => format!("{} → base theme ({how})", ws.label),
+    };
+    commit(ctx, &path, &original, &updated, dry_run, &what)?;
+
+    let managed = tokens
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    let target = palette_name
+        .filter(|_| cfg.window_tint)
+        .and_then(|n| cfg.palettes[n].window_bg(light));
+    finish_apply(
+        &mut st,
+        managed,
+        managed_sidebar,
+        dry_run,
+        |st| save_state(ctx, st),
+        |w| {
+            if cfg.window_tint {
+                window::apply(w, target.as_deref(), dry_run)
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    )
+}
+
+/// Records what `commit` just wrote and saves it before tinting the window.
+/// The fingerprint must reach disk before anything else can fail: a stale
+/// one would make the next apply see the plugin's own rows as foreign.
+fn finish_apply(
+    st: &mut State,
+    managed: Vec<String>,
+    managed_sidebar: BTreeMap<String, String>,
+    dry_run: bool,
+    mut save: impl FnMut(&State) -> Res<()>,
+    tint: impl FnOnce(&mut window::WindowState) -> Res<Vec<String>>,
+) -> Res<()> {
+    if !dry_run {
+        st.managed = managed;
+        st.managed_sidebar = managed_sidebar;
+        save(st)?;
+    }
+    for line in tint(&mut st.window)? {
+        outln!("[{TAG}] {line}");
+    }
+    if !dry_run {
+        save(st)?;
+    }
+    Ok(())
+}
+
+const LOCK_BUSY: &str = "another apply kept the lock past the wait";
+
+/// The theme lives in the shared `config.toml`, so its write is serialised
+/// across sessions by `apply.lock`; the sidebar tags are per session and only
+/// take that session's lock. The two are never held together.
 fn cmd_apply(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        outln!("[{TAG}] another apply is running; skipped");
-        return Ok(());
-    };
-    let mut st = load_state(&ctx);
+    let session = current_session(&ctx);
 
     let id = resolve_workspace_id(&ctx)?;
     let ws = find_workspace(&ctx, &id)?;
@@ -1424,49 +1796,24 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
         _ => "no rule, auto off",
     };
 
-    let path = herdr_config_path(&cfg);
-    let original =
-        fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let doc: DocumentMut = original
-        .parse()
-        .map_err(|e| format!("herdr config parse error: {e}"))?;
-    let light = theme_mode(&doc) == ThemeMode::Light;
+    match acquire_lock(&ctx.state_dir, "apply.lock")? {
+        Some(_lock) => apply_shared(&ctx, &cfg, &ws, palette_name, how, dry_run)?,
+        None => outln!("[{TAG}] {LOCK_BUSY}; theme skipped"),
+    }
 
-    let tokens = palette_name.map(|n| cfg.palettes[n].effective(light));
-    let spec = sidebar_spec(&cfg, light);
-    let plan = Plan {
-        theme: tokens.as_ref(),
-        previously_managed: &st.managed,
-        sidebar: spec.as_ref(),
-        managed_sidebar: &st.managed_sidebar,
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        outln!("[{TAG}] {LOCK_BUSY}; sidebar tags skipped");
+        return Ok(());
     };
-    let (updated, managed_sidebar) = plan_full(&original, &plan)?;
-    let what = match palette_name {
-        Some(n) => format!("{} → {n} ({how})", ws.label),
-        None => format!("{} → base theme ({how})", ws.label),
-    };
-    commit(&ctx, &path, &original, &updated, dry_run, &what)?;
-
-    let tagged = sweep(&ctx, &cfg, &mut st, dry_run)?;
+    let mut sst = load_session_state(&ctx.state_dir, &session);
+    let tagged = sweep(&ctx, &cfg, &mut sst, dry_run)?;
     if tagged > 0 {
         outln!("[{TAG}] sidebar tags: {tagged} updated");
     }
-
-    if cfg.window_tint {
-        let target = palette_name.and_then(|n| cfg.palettes[n].window_bg(light));
-        for line in window::apply(&mut st.window, target.as_deref(), dry_run)? {
-            outln!("[{TAG}] {line}");
-        }
-    }
-
     if !dry_run {
-        st.managed = tokens
-            .map(|t| t.keys().cloned().collect())
-            .unwrap_or_default();
-        st.managed_sidebar = managed_sidebar;
-        st.last_workspace = Some(ws.id);
-        st.last_palette = palette_name.map(str::to_owned);
-        save_state(&ctx, &st)?;
+        sst.last_workspace = Some(ws.id);
+        sst.last_palette = palette_name.map(str::to_owned);
+        save_session_state(&ctx.state_dir, &session, &sst)?;
     }
     Ok(())
 }
@@ -1474,47 +1821,60 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
 fn cmd_sweep(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        outln!("[{TAG}] another apply is running; skipped");
+    let session = current_session(&ctx);
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        outln!("[{TAG}] {LOCK_BUSY}; skipped");
         return Ok(());
     };
-    let mut st = load_state(&ctx);
+    let mut st = load_session_state(&ctx.state_dir, &session);
     let n = sweep(&ctx, &cfg, &mut st, dry_run)?;
     outln!("[{TAG}] sidebar tags: {n} updated");
     if !dry_run {
-        save_state(&ctx, &st)?;
+        save_session_state(&ctx.state_dir, &session, &st)?;
     }
     Ok(())
 }
 
+/// Restores the shared config and every tinted window, and drops the tags of
+/// the calling session. Other sessions keep their tags, which render nothing
+/// once the managed sidebar rows are gone, and their caches stay accurate.
 fn cmd_clear(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        return Err("another apply is running; try again".into());
+    let session = current_session(&ctx);
+    {
+        let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
+            return Err(format!("{LOCK_BUSY}; try again"));
+        };
+        let mut st = load_state(&ctx);
+        let path = herdr_config_path(&cfg);
+        let original =
+            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let planned = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
+        report_released(&planned.released);
+        commit(&ctx, &path, &original, &planned.text, dry_run, "clear")?;
+        if !dry_run {
+            for line in window::restore_all(&mut st.window)? {
+                outln!("[{TAG}] {line}");
+            }
+            save_state(&ctx, &State::default())?;
+        }
+    }
+
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        return Err(format!("{LOCK_BUSY}; try again"));
     };
-    let st = load_state(&ctx);
-
-    let path = herdr_config_path(&cfg);
-    let original =
-        fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let updated = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
-    commit(&ctx, &path, &original, &updated, dry_run, "clear")?;
-
+    let sst = load_session_state(&ctx.state_dir, &session);
     if dry_run {
         outln!(
             "[{TAG}] clear: would drop tags on {} workspaces and {} panes",
-            st.ws_tokens.len(),
-            st.pane_tokens.len()
+            sst.ws_tokens.len(),
+            sst.pane_tokens.len()
         );
         return Ok(());
     }
-    clear_tags(&ctx, &cfg, &st)?;
-    let mut st = st;
-    for line in window::restore_all(&mut st.window)? {
-        outln!("[{TAG}] {line}");
-    }
-    save_state(&ctx, &State::default())?;
+    clear_tags(&ctx, &cfg, &sst)?;
+    save_session_state(&ctx.state_dir, &session, &SessionState::default())?;
     Ok(())
 }
 
@@ -1529,7 +1889,17 @@ fn cmd_status() -> Res<()> {
         .map(|d| theme_mode(&d));
 
     outln!("herdr config:  {}", path.display());
+    let session = current_session(&ctx);
     outln!("state:         {}", state_path(&ctx).display());
+    outln!(
+        "session:       {} ({})",
+        session.name,
+        session.socket.as_deref().unwrap_or("socket unknown")
+    );
+    outln!(
+        "session state: {}",
+        session_state_path(&ctx.state_dir, &session.key).display()
+    );
     outln!(
         "theme mode:    {}",
         match mode {
@@ -1556,7 +1926,8 @@ fn cmd_status() -> Res<()> {
         } else if st.managed_sidebar.is_empty() {
             "not managed yet (or user-defined)".into()
         } else {
-            format!("managed: {}", st.managed_sidebar.join(", "))
+            let kinds: Vec<&str> = st.managed_sidebar.keys().map(String::as_str).collect();
+            format!("managed: {}", kinds.join(", "))
         }
     );
     outln!(
@@ -2124,6 +2495,219 @@ fn cmd_install_cli() -> Res<()> {
 mod tests {
     use super::*;
 
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("space-colors-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lock_contention_retries_then_proceeds() {
+        let dir = scratch_dir("lock-retry");
+        let path = dir.join("apply.lock");
+        let held = acquire_lock_at(&path, Duration::ZERO).unwrap().unwrap();
+        let start = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let got = acquire_lock_at(&path, Duration::from_secs(3)).unwrap();
+        releaser.join().unwrap();
+        assert!(
+            got.is_some(),
+            "waiter must get the lock once it is released"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn lock_held_past_the_wait_gives_up_and_a_stale_lock_is_taken_over() {
+        let dir = scratch_dir("lock-timeout");
+        let path = dir.join("apply.lock");
+        let _held = acquire_lock_at(&path, Duration::ZERO).unwrap().unwrap();
+        let start = Instant::now();
+        assert!(acquire_lock_at(&path, Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+        assert!(start.elapsed() >= Duration::from_millis(200));
+
+        let stale = dir.join("stale.lock");
+        let f = fs::File::create(&stale).unwrap();
+        f.set_modified(SystemTime::now() - LOCK_STALE * 2).unwrap();
+        assert!(acquire_lock_at(&stale, Duration::ZERO).unwrap().is_some());
+    }
+
+    fn session(socket: &str) -> Session {
+        Session {
+            name: "test".into(),
+            socket: Some(socket.into()),
+            key: session_key(Some(socket), "test"),
+            server: Some(format!("{socket}#1")),
+        }
+    }
+
+    fn want(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, (Option<String>, Via)> {
+        pairs
+            .iter()
+            .map(|(id, p)| (id.to_string(), (p.map(str::to_owned), Via::Auto)))
+            .collect()
+    }
+
+    /// What a successful sweep records: every reported tag lands in the cache.
+    fn record(st: &mut SessionState, w: &BTreeMap<String, (Option<String>, Via)>) {
+        for (id, palette) in stale_tags(&mut st.ws_tokens, w) {
+            st.ws_tokens.insert(id, palette.unwrap_or_default());
+        }
+    }
+
+    #[test]
+    fn session_key_follows_the_socket_and_falls_back_to_the_name() {
+        let a = session_key(Some("/h/.config/herdr/herdr.sock"), "default");
+        let b = session_key(Some("/h/.config/herdr/sessions/two/herdr.sock"), "two");
+        assert_ne!(a, b);
+        assert_eq!(a, session_key(Some("/h/.config/herdr/herdr.sock"), "other"));
+        assert_ne!(session_key(None, "two"), session_key(None, "default"));
+        assert_ne!(session_key(None, "two"), b);
+        assert!(a.len() == 16 && a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sessions_with_overlapping_ids_keep_independent_caches() {
+        let dir = scratch_dir("sessions-independent");
+        let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
+        let mut sa = load_session_state(&dir, &a);
+        sa.ws_tokens.insert("w1".into(), "peach".into());
+        sa.pane_tokens.insert("w1:p1".into(), "peach".into());
+        let mut sb = load_session_state(&dir, &b);
+        sb.ws_tokens.insert("w1".into(), "blue".into());
+        sb.pane_tokens.insert("w1:p1".into(), "teal".into());
+        save_session_state(&dir, &a, &sa).unwrap();
+        save_session_state(&dir, &b, &sb).unwrap();
+        assert_eq!(load_session_state(&dir, &a), sa);
+        assert_eq!(load_session_state(&dir, &b), sb);
+    }
+
+    #[test]
+    fn a_sweep_in_one_session_does_not_suppress_tags_in_another() {
+        let dir = scratch_dir("sessions-sweep");
+        let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
+
+        // B tagged w3 earlier; A has no w3 at all.
+        let mut sb = load_session_state(&dir, &b);
+        record(&mut sb, &want(&[("w3", Some("mauve"))]));
+        save_session_state(&dir, &b, &sb).unwrap();
+
+        // A sweeps its own w1 → peach (and retains only its live ids).
+        let mut sa = load_session_state(&dir, &a);
+        record(&mut sa, &want(&[("w1", Some("peach"))]));
+        save_session_state(&dir, &a, &sa).unwrap();
+
+        // B's w1 also wants peach but was never tagged in B: it must be reported,
+        // and B's w3 survives A's retain.
+        let mut sb = load_session_state(&dir, &b);
+        let stale = stale_tags(
+            &mut sb.ws_tokens,
+            &want(&[("w1", Some("peach")), ("w3", Some("mauve"))]),
+        );
+        assert_eq!(stale, vec![("w1".to_string(), Some("peach".to_string()))]);
+        assert_eq!(sb.ws_tokens.get("w3").map(String::as_str), Some("mauve"));
+    }
+
+    #[test]
+    fn a_restarted_server_voids_the_tag_cache() {
+        let dir = scratch_dir("server-restart");
+        let mut a = session("/s/a.sock");
+        let mut st = load_session_state(&dir, &a);
+        record(&mut st, &want(&[("w1", Some("peach"))]));
+        save_session_state(&dir, &a, &st).unwrap();
+        assert_eq!(load_session_state(&dir, &a).ws_tokens.len(), 1);
+
+        // Same socket path (same key), new server instance: ids come back
+        // without their tokens, so w1 must be reported again.
+        a.server = Some("/s/a.sock#2".into());
+        let mut st = load_session_state(&dir, &a);
+        assert!(st.ws_tokens.is_empty());
+        assert_eq!(st.server.as_deref(), Some("/s/a.sock#2"));
+        assert_eq!(
+            stale_tags(&mut st.ws_tokens, &want(&[("w1", Some("peach"))])).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_tags_skips_what_is_in_place_and_drops_dead_ids() {
+        let mut cache: BTreeMap<String, String> = [
+            ("w1".to_string(), "peach".to_string()),
+            ("w2".to_string(), String::new()),
+            ("w9".to_string(), "red".to_string()),
+        ]
+        .into();
+        let stale = stale_tags(
+            &mut cache,
+            &want(&[("w1", Some("peach")), ("w2", None), ("w3", None)]),
+        );
+        assert_eq!(stale, vec![("w3".to_string(), None)]);
+        assert!(!cache.contains_key("w9"));
+    }
+
+    #[test]
+    fn legacy_shared_caches_are_ignored_and_dropped_on_save() {
+        let dir = scratch_dir("legacy-state");
+        let ctx = Ctx {
+            herdr: "herdr".into(),
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        fs::write(
+            state_path(&ctx),
+            r##"{"managed":["accent"],"managed_sidebar":["agents","spaces"],
+                "ws_tokens":{"w1":"peach"},"pane_tokens":{"w1:p1":"peach"},
+                "last_workspace":"w1","window_original":{"ttys001":"#000000"}}"##,
+        )
+        .unwrap();
+        let st = load_state(&ctx);
+        assert_eq!(st.managed, vec!["accent"]);
+        assert_eq!(
+            st.managed_sidebar,
+            BTreeMap::from([
+                ("agents".into(), String::new()),
+                ("spaces".into(), String::new())
+            ]),
+            "a list from 0.3.3 means managed, fingerprint unknown"
+        );
+        assert_eq!(
+            st.window.original.get("ttys001").map(String::as_str),
+            Some("#000000")
+        );
+        let fresh = load_session_state(&dir, &session("/s/a.sock"));
+        assert!(fresh.ws_tokens.is_empty() && fresh.pane_tokens.is_empty());
+
+        save_state(&ctx, &st).unwrap();
+        let text = fs::read_to_string(state_path(&ctx)).unwrap();
+        assert!(!text.contains("ws_tokens") && !text.contains("pane_tokens"));
+        assert!(text.contains("accent"));
+    }
+
+    #[test]
+    fn herdr_dirs_follow_xdg_like_herdr_and_fall_back_to_home() {
+        use std::ffi::OsStr;
+        let home = Path::new("/h");
+        assert_eq!(
+            herdr_dir(Some(OsStr::new("/x/cfg")), home, ".config"),
+            Path::new("/x/cfg/herdr")
+        );
+        assert_eq!(
+            herdr_dir(None, home, ".config"),
+            Path::new("/h/.config/herdr")
+        );
+        assert_eq!(
+            herdr_dir(Some(OsStr::new("")), home, ".local/state"),
+            Path::new("/h/.local/state/herdr")
+        );
+    }
+
     #[test]
     fn manifest_lists_every_generated_palette_action() {
         let manifest = include_str!("../herdr-plugin.toml");
@@ -2224,10 +2808,14 @@ command = \"herdr-layout-cycle.cycle-layout\"
             theme: Some(&p),
             previously_managed: &[],
             sidebar: Some(&spec),
-            managed_sidebar: &[],
+            managed_sidebar: &BTreeMap::new(),
         };
-        let (applied, managed) = plan_full(USER_CONFIG, &plan).unwrap();
-        assert_eq!(managed, vec!["agents".to_string(), "spaces".to_string()]);
+        let Planned {
+            text: applied,
+            managed_sidebar: managed,
+            ..
+        } = plan_full(USER_CONFIG, &plan).unwrap();
+        assert_eq!(managed.keys().collect::<Vec<_>>(), ["agents", "spaces"]);
         assert!(applied.contains("[ui.sidebar.agents]"), "{applied}");
         assert!(
             applied.contains("token = \"$sc_red\", fg = \"#f38ba8\", bold = true"),
@@ -2243,7 +2831,7 @@ command = \"herdr-layout-cycle.cycle-layout\"
             "user's [ui] keys must survive"
         );
         let cleared = plan_clear(&applied, &["accent".into()], &managed).unwrap();
-        assert_eq!(cleared, USER_CONFIG);
+        assert_eq!(cleared.text, USER_CONFIG);
     }
 
     #[test]
@@ -2256,12 +2844,16 @@ command = \"herdr-layout-cycle.cycle-layout\"
             theme: None,
             previously_managed: &[],
             sidebar: Some(&spec),
-            managed_sidebar: &[],
+            managed_sidebar: &BTreeMap::new(),
         };
-        let (applied, managed) = plan_full(&base, &plan).unwrap();
+        let Planned {
+            text: applied,
+            managed_sidebar: managed,
+            ..
+        } = plan_full(&base, &plan).unwrap();
         assert_eq!(
-            managed,
-            vec!["spaces".to_string()],
+            managed.keys().collect::<Vec<_>>(),
+            ["spaces"],
             "only the absent kind is managed"
         );
         assert!(
@@ -2269,7 +2861,175 @@ command = \"herdr-layout-cycle.cycle-layout\"
             "user rows preserved verbatim"
         );
         let cleared = plan_clear(&applied, &[], &managed).unwrap();
-        assert_eq!(cleared, base);
+        assert_eq!(cleared.text, base);
+    }
+
+    fn spec_of(pairs: &[(&str, &str)]) -> SidebarSpec {
+        SidebarSpec {
+            colours: pairs
+                .iter()
+                .map(|(n, c)| (n.to_string(), c.to_string()))
+                .collect(),
+        }
+    }
+
+    fn apply_rows(text: &str, spec: &SidebarSpec, managed: &BTreeMap<String, String>) -> Planned {
+        let plan = Plan {
+            theme: None,
+            previously_managed: &[],
+            sidebar: Some(spec),
+            managed_sidebar: managed,
+        };
+        plan_full(text, &plan).unwrap()
+    }
+
+    const CREW_ROWS: &str =
+        "rows = [[\"state_icon\", \"$crew_top_peach\", \"$crew_tab\"], [\"state_text\"]]";
+
+    #[test]
+    fn rows_replaced_after_a_write_survive_apply_focus_and_clear() {
+        let spec = spec_of(&[("red", "#f38ba8"), ("blue", "#89b4fa")]);
+        let first = apply_rows(USER_CONFIG, &spec, &BTreeMap::new());
+        assert_eq!(first.managed_sidebar.len(), 2);
+
+        // Another tool replaces the agents rows the plugin wrote.
+        let doc: DocumentMut = first.text.parse().unwrap();
+        let mut doc = doc;
+        doc["ui"]["sidebar"]["agents"]["rows"] = toml_edit::Item::None;
+        let theirs = doc.to_string().replace(
+            "[ui.sidebar.agents]\n",
+            &format!("[ui.sidebar.agents]\n{CREW_ROWS}\n"),
+        );
+        assert!(theirs.contains(CREW_ROWS), "{theirs}");
+
+        // Next focus: agents released and untouched, spaces still managed.
+        let second = apply_rows(&theirs, &spec, &first.managed_sidebar);
+        assert_eq!(second.released, ["agents"]);
+        assert_eq!(
+            second.managed_sidebar.keys().collect::<Vec<_>>(),
+            ["spaces"]
+        );
+        assert!(second.text.contains(CREW_ROWS));
+        assert_eq!(second.text, theirs);
+
+        // A later focus no longer considers them, and does not re-report.
+        let third = apply_rows(&second.text, &spec, &second.managed_sidebar);
+        assert!(third.released.is_empty());
+        assert!(third.text.contains(CREW_ROWS));
+
+        // Clear removes only the spaces rows.
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
+        assert!(cleared.text.contains(CREW_ROWS));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+
+        // Clear straight after the replacement (no apply in between) also keeps them.
+        let cleared = plan_clear(&theirs, &[], &first.managed_sidebar).unwrap();
+        assert_eq!(cleared.released, ["agents"]);
+        assert!(cleared.text.contains(CREW_ROWS));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+    }
+
+    #[test]
+    fn untouched_managed_rows_still_follow_palette_changes() {
+        let dark = spec_of(&[("red", "#f38ba8")]);
+        let light = spec_of(&[("red", "#d20f39")]);
+        let first = apply_rows(USER_CONFIG, &dark, &BTreeMap::new());
+        let second = apply_rows(&first.text, &light, &first.managed_sidebar);
+        assert!(second.released.is_empty());
+        assert_eq!(second.managed_sidebar.len(), 2);
+        assert!(second.text.contains("#d20f39") && !second.text.contains("#f38ba8"));
+        // Reformatting the plugin's own rows does not count as a change.
+        let reformatted = second.text.replace(", ", ",  ");
+        let third = apply_rows(&reformatted, &light, &second.managed_sidebar);
+        assert!(third.released.is_empty());
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
+        assert_eq!(cleared.text, USER_CONFIG);
+    }
+
+    fn legacy_managed() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("agents".to_string(), String::new()),
+            ("spaces".to_string(), String::new()),
+        ])
+    }
+
+    #[test]
+    fn rows_without_a_fingerprint_are_kept_by_shape_even_after_a_palette_edit() {
+        // Written by 0.3.3 from the old palettes; the config has changed since.
+        let old = spec_of(&[("red", "#f38ba8"), ("blue", "#89b4fa")]);
+        let ours = apply_rows(USER_CONFIG, &old, &BTreeMap::new()).text;
+        let edited = spec_of(&[("red", "#d20f39"), ("green", "#a6e3a1")]);
+        let kept = apply_rows(&ours, &edited, &legacy_managed());
+        assert!(kept.released.is_empty());
+        assert!(kept.managed_sidebar.values().all(|fp| !fp.is_empty()));
+        assert!(kept.text.contains("$sc_green") && !kept.text.contains("#89b4fa"));
+
+        // Clear straight from legacy state also removes them.
+        let cleared = plan_clear(&ours, &[], &legacy_managed()).unwrap();
+        assert!(cleared.released.is_empty());
+        assert_eq!(cleared.text, USER_CONFIG);
+    }
+
+    #[test]
+    fn rows_without_a_fingerprint_are_released_when_they_carry_foreign_tokens() {
+        let spec = spec_of(&[("red", "#f38ba8")]);
+        let ours = apply_rows(USER_CONFIG, &spec, &BTreeMap::new()).text;
+        let theirs = ours.replacen(
+            "\"workspace\", \"tab\"]",
+            "\"$crew_top_peach\", \"workspace\", \"tab\"]",
+            1,
+        );
+        assert_ne!(theirs, ours);
+        let planned = apply_rows(&theirs, &spec, &legacy_managed());
+        assert_eq!(planned.released, ["agents"]);
+        assert_eq!(planned.text, theirs);
+        let cleared = plan_clear(&theirs, &[], &legacy_managed()).unwrap();
+        assert!(cleared.text.contains("$crew_top_peach"));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+
+        // Other shapes that are not ours.
+        let doc: DocumentMut = r##"
+rows = [["state_icon", { token = "$sc_red", fg = "#f38ba8", bold = true, italic = true }, "workspace", "tab"], ["agent"]]
+plain = [["agent"]]
+"##
+        .parse()
+        .unwrap();
+        assert!(!looks_generated(&doc["rows"], "agents"));
+        assert!(!looks_generated(&doc["plain"], "agents"));
+    }
+
+    #[test]
+    fn fingerprint_is_saved_before_a_failing_window_tint() {
+        let spec = spec_of(&[("red", "#f38ba8")]);
+        let first = apply_rows(USER_CONFIG, &spec, &BTreeMap::new());
+        let mut st = State {
+            managed_sidebar: first.managed_sidebar.clone(),
+            ..State::default()
+        };
+        // A palette change rewrites the rows; then the tint fails.
+        let light = spec_of(&[("red", "#d20f39")]);
+        let second = apply_rows(&first.text, &light, &st.managed_sidebar);
+        let mut saved = None;
+        let err = finish_apply(
+            &mut st,
+            vec!["accent".into()],
+            second.managed_sidebar.clone(),
+            false,
+            |s| {
+                saved = Some(s.managed_sidebar.clone());
+                Ok(())
+            },
+            |_| Err("osascript: not authorised".into()),
+        );
+        assert!(err.is_err());
+        let saved = saved.expect("state saved before the tint");
+        assert_eq!(saved, second.managed_sidebar);
+
+        // The next apply still owns its rows, and clear removes them.
+        let third = apply_rows(&second.text, &light, &saved);
+        assert!(third.released.is_empty());
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
+        assert!(!cleared.text.contains("$sc_red"));
     }
 
     #[test]
@@ -2278,7 +3038,9 @@ command = \"herdr-layout-cycle.cycle-layout\"
             "{USER_CONFIG}\n[theme]\nname = \"catppuccin\"\n\n[theme.custom]\ntext = \"#ffffff\"\n"
         );
         let applied = plan_apply(&base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
-        let cleared = plan_clear(&applied, &["accent".into()], &[]).unwrap();
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new())
+            .unwrap()
+            .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));
         assert!(cleared.contains("[theme]\nname = \"catppuccin\""));
     }
@@ -2288,7 +3050,9 @@ command = \"herdr-layout-cycle.cycle-layout\"
         let base = "[theme]\ncustom = { text = \"#ffffff\" }\n";
         let applied = plan_apply(base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
         assert!(applied.contains("accent = \"#f38ba8\"") && applied.contains("text = \"#ffffff\""));
-        let cleared = plan_clear(&applied, &["accent".into()], &[]).unwrap();
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new())
+            .unwrap()
+            .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));
     }
 

@@ -14,7 +14,7 @@
 auto = true
 
 # Path to herdr's config.toml. Normally not needed; the default is
-# ~/.config/herdr/config.toml, and $HERDR_CONFIG_PATH always wins.
+# ${XDG_CONFIG_HOME:-~/.config}/herdr/config.toml, and $HERDR_CONFIG_PATH always wins.
 # herdr_config = "~/.config/herdr/config.toml"
 
 [sidebar]
