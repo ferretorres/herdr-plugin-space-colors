@@ -571,6 +571,21 @@ struct SessionState {
     ws_tokens: BTreeMap<String, String>,
     last_workspace: Option<String>,
     last_palette: Option<String>,
+    /// Identity of the server the caches were written against.
+    server: Option<String>,
+}
+
+impl SessionState {
+    /// Reported tokens live in the server's memory only: a restarted server
+    /// restores the same ids without their tokens, so caches written against
+    /// another server instance are void.
+    fn adopt_server(&mut self, server: Option<&str>) {
+        if self.server.as_deref() != server {
+            self.ws_tokens.clear();
+            self.pane_tokens.clear();
+            self.server = server.map(str::to_owned);
+        }
+    }
 }
 
 /// The herdr server a command talks to.
@@ -578,6 +593,14 @@ struct Session {
     name: String,
     socket: Option<String>,
     key: String,
+    /// The socket file's inode and mtime; a server start creates a new socket.
+    server: Option<String>,
+}
+
+fn server_stamp(socket: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = fs::metadata(socket).ok()?;
+    Some(format!("{}:{}:{}", m.ino(), m.mtime(), m.mtime_nsec()))
 }
 
 /// File-name-safe key for a session. The socket path identifies the server;
@@ -601,6 +624,7 @@ fn current_session(ctx: &Ctx) -> Session {
         .or_else(|| lookup_socket(ctx, &name));
     Session {
         key: session_key(socket.as_deref(), &name),
+        server: socket.as_deref().and_then(|s| server_stamp(Path::new(s))),
         name,
         socket,
     }
@@ -688,7 +712,7 @@ fn save_state(ctx: &Ctx, st: &State) -> Res<()> {
     write_state_file(&ctx.state_dir, &state_path(ctx), &v)
 }
 
-fn load_session_state(dir: &Path, key: &str) -> SessionState {
+fn read_session_state(dir: &Path, key: &str) -> SessionState {
     let Some(v) = read_json(&session_state_path(dir, key)) else {
         return SessionState::default();
     };
@@ -697,7 +721,14 @@ fn load_session_state(dir: &Path, key: &str) -> SessionState {
         ws_tokens: str_map(&v["ws_tokens"]),
         last_workspace: v["last_workspace"].as_str().map(str::to_owned),
         last_palette: v["last_palette"].as_str().map(str::to_owned),
+        server: v["server"].as_str().map(str::to_owned),
     }
+}
+
+fn load_session_state(dir: &Path, session: &Session) -> SessionState {
+    let mut st = read_session_state(dir, &session.key);
+    st.adopt_server(session.server.as_deref());
+    st
 }
 
 fn save_session_state(dir: &Path, session: &Session, st: &SessionState) -> Res<()> {
@@ -708,6 +739,7 @@ fn save_session_state(dir: &Path, session: &Session, st: &SessionState) -> Res<(
         "ws_tokens": st.ws_tokens,
         "last_workspace": st.last_workspace,
         "last_palette": st.last_palette,
+        "server": st.server,
     });
     write_state_file(dir, &session_state_path(dir, &session.key), &v)
 }
@@ -1577,7 +1609,7 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
         outln!("[{TAG}] {LOCK_BUSY}; sidebar tags skipped");
         return Ok(());
     };
-    let mut sst = load_session_state(&ctx.state_dir, &session.key);
+    let mut sst = load_session_state(&ctx.state_dir, &session);
     let tagged = sweep(&ctx, &cfg, &mut sst, dry_run)?;
     if tagged > 0 {
         outln!("[{TAG}] sidebar tags: {tagged} updated");
@@ -1598,7 +1630,7 @@ fn cmd_sweep(dry_run: bool) -> Res<()> {
         outln!("[{TAG}] {LOCK_BUSY}; skipped");
         return Ok(());
     };
-    let mut st = load_session_state(&ctx.state_dir, &session.key);
+    let mut st = load_session_state(&ctx.state_dir, &session);
     let n = sweep(&ctx, &cfg, &mut st, dry_run)?;
     outln!("[{TAG}] sidebar tags: {n} updated");
     if !dry_run {
@@ -1635,7 +1667,7 @@ fn cmd_clear(dry_run: bool) -> Res<()> {
     let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
         return Err(format!("{LOCK_BUSY}; try again"));
     };
-    let sst = load_session_state(&ctx.state_dir, &session.key);
+    let sst = load_session_state(&ctx.state_dir, &session);
     if dry_run {
         outln!(
             "[{TAG}] clear: would drop tags on {} workspaces and {} panes",
@@ -2314,6 +2346,7 @@ mod tests {
             name: "test".into(),
             socket: Some(socket.into()),
             key: session_key(Some(socket), "test"),
+            server: Some(format!("{socket}#1")),
         }
     }
 
@@ -2346,16 +2379,16 @@ mod tests {
     fn sessions_with_overlapping_ids_keep_independent_caches() {
         let dir = scratch_dir("sessions-independent");
         let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
-        let mut sa = SessionState::default();
+        let mut sa = load_session_state(&dir, &a);
         sa.ws_tokens.insert("w1".into(), "peach".into());
         sa.pane_tokens.insert("w1:p1".into(), "peach".into());
-        let mut sb = SessionState::default();
+        let mut sb = load_session_state(&dir, &b);
         sb.ws_tokens.insert("w1".into(), "blue".into());
         sb.pane_tokens.insert("w1:p1".into(), "teal".into());
         save_session_state(&dir, &a, &sa).unwrap();
         save_session_state(&dir, &b, &sb).unwrap();
-        assert_eq!(load_session_state(&dir, &a.key), sa);
-        assert_eq!(load_session_state(&dir, &b.key), sb);
+        assert_eq!(load_session_state(&dir, &a), sa);
+        assert_eq!(load_session_state(&dir, &b), sb);
     }
 
     #[test]
@@ -2364,24 +2397,45 @@ mod tests {
         let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
 
         // B tagged w3 earlier; A has no w3 at all.
-        let mut sb = SessionState::default();
+        let mut sb = load_session_state(&dir, &b);
         record(&mut sb, &want(&[("w3", Some("mauve"))]));
         save_session_state(&dir, &b, &sb).unwrap();
 
         // A sweeps its own w1 → peach (and retains only its live ids).
-        let mut sa = load_session_state(&dir, &a.key);
+        let mut sa = load_session_state(&dir, &a);
         record(&mut sa, &want(&[("w1", Some("peach"))]));
         save_session_state(&dir, &a, &sa).unwrap();
 
         // B's w1 also wants peach but was never tagged in B: it must be reported,
         // and B's w3 survives A's retain.
-        let mut sb = load_session_state(&dir, &b.key);
+        let mut sb = load_session_state(&dir, &b);
         let stale = stale_tags(
             &mut sb.ws_tokens,
             &want(&[("w1", Some("peach")), ("w3", Some("mauve"))]),
         );
         assert_eq!(stale, vec![("w1".to_string(), Some("peach".to_string()))]);
         assert_eq!(sb.ws_tokens.get("w3").map(String::as_str), Some("mauve"));
+    }
+
+    #[test]
+    fn a_restarted_server_voids_the_tag_cache() {
+        let dir = scratch_dir("server-restart");
+        let mut a = session("/s/a.sock");
+        let mut st = load_session_state(&dir, &a);
+        record(&mut st, &want(&[("w1", Some("peach"))]));
+        save_session_state(&dir, &a, &st).unwrap();
+        assert_eq!(load_session_state(&dir, &a).ws_tokens.len(), 1);
+
+        // Same socket path (same key), new server instance: ids come back
+        // without their tokens, so w1 must be reported again.
+        a.server = Some("/s/a.sock#2".into());
+        let mut st = load_session_state(&dir, &a);
+        assert!(st.ws_tokens.is_empty());
+        assert_eq!(st.server.as_deref(), Some("/s/a.sock#2"));
+        assert_eq!(
+            stale_tags(&mut st.ws_tokens, &want(&[("w1", Some("peach"))])).len(),
+            1
+        );
     }
 
     #[test]
@@ -2422,10 +2476,8 @@ mod tests {
             st.window.original.get("ttys001").map(String::as_str),
             Some("#000000")
         );
-        assert_eq!(
-            load_session_state(&dir, &session("/s/a.sock").key),
-            SessionState::default()
-        );
+        let fresh = load_session_state(&dir, &session("/s/a.sock"));
+        assert!(fresh.ws_tokens.is_empty() && fresh.pane_tokens.is_empty());
 
         save_state(&ctx, &st).unwrap();
         let text = fs::read_to_string(state_path(&ctx)).unwrap();
