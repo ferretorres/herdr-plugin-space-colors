@@ -227,7 +227,9 @@ The plugin writes to your herdr `config.toml`. The contract:
 - **One-time backup** to `config.toml.space-colors.bak` before its first edit.
 - **Verify, then roll back.** `herdr config check` after every write; on
   failure the previous bytes are restored and a toast tells you.
-- **Atomic writes** and a **lock** so two fast focus events cannot race.
+- **Atomic writes** and a **lock** so two fast focus events, or two
+  sessions starting together, cannot race. A busy lock is retried for up to
+  three seconds rather than skipped.
 - **`clear` gets you back.** Removes the managed keys, the managed rows and
   every sidebar token; a config the plugin created from scratch comes back
   byte-identical.
@@ -244,12 +246,32 @@ herdr plugin uninstall ferretorres.space-colors
 
 Then remove the hook from `~/.zshrc` (marked `# herdr-space-colors shell hook`)
 and `~/.local/bin/herdr-space-colors`. Runtime state lives under
-`~/.local/state/herdr/plugins/ferretorres.space-colors/`.
+`~/.local/state/herdr/plugins/ferretorres.space-colors/`: `state.json` for
+the shared theme and window tint, plus one `state-<key>.json` per herdr
+session.
+
+## Several sessions
+
+Named sessions (`herdr --session work`) each run their own server, and ids
+such as `w1` exist in all of them. The plugin keeps the sidebar tag state of
+each session apart, keyed by the session's socket (`HERDR_SOCKET_PATH`, which
+herdr sets for plugin commands; from a plain shell it is looked up through
+`HERDR_SESSION`, else the default session). Sidebar tags and pane tints are
+therefore correct in every session at once. `herdr-space-colors status`
+shows which session and state file a command used.
+
+The theme is the exception. It lives in the one `config.toml` every session
+reads, and herdr (up to 0.9.5) has no per-session or runtime theme call, so
+the last focused workspace in *any* session sets the chrome colour, and the
+other sessions pick it up on their next reload or start. Their sidebar
+markers stay correct. Window tint follows each session's own clients.
 
 ## Limitations
 
 - The theme is one at a time: the focused workspace decides the chrome
   colour. Unfocused workspaces are distinguished by their sidebar markers.
+  With several sessions open the last focus in any of them wins, because
+  `config.toml` is shared; see [Several sessions](#several-sessions).
 - Sidebar row settings affect the expanded desktop sidebar only (herdr keeps
   collapsed and mobile layouts compact).
 - Agents with a `ui.sidebar.agents.rows_by_agent` override use that override,

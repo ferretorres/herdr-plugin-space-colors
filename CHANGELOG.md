@@ -3,6 +3,33 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.4] - 2026-11-26
+
+### Fixed
+
+- Several herdr sessions at once. Each session runs its own server, but all
+  share the plugin state dir, and workspace and pane ids (`w1`, `w1:p1`)
+  repeat in every session. The sidebar tag caches were shared, so a sweep in
+  one session could prune another's entries or mark a tag as already in
+  place in a session where it was never written. The caches now live in one
+  `state-<key>.json` per session, keyed by a hash of `HERDR_SOCKET_PATH`;
+  `state.json` keeps only what belongs to the shared `config.toml` and the
+  window tint. The old shared caches are ignored and dropped on the next
+  save (one redundant tag write per pane and Space, once).
+- Startup in several sessions at once no longer skips the theme. A held lock
+  is retried with backoff for up to three seconds instead of printing
+  "another apply is running; skipped". The theme write keeps a global lock,
+  since `config.toml` is shared; sidebar tags take a per-session lock.
+- Sidebar tags come back after a server restart. herdr restores the same ids
+  without their reported tokens, so the cache is now dropped when the
+  session's server instance changes.
+
+### Changed
+
+- `status` shows the session, its socket and its state file. `clear` drops
+  only the calling session's tags; the shared theme and rows are restored
+  for all sessions as before.
+
 ## [0.3.3] - 2026-09-08
 
 ### Added
