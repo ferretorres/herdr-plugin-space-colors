@@ -810,6 +810,10 @@ fn acquire_lock_at(path: &Path, wait: Duration) -> Res<Option<Lock>> {
                     .and_then(|m| m.modified())
                     .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() > LOCK_STALE)
                     .unwrap_or(false);
+                // ponytail: two waiters that both see a stale lock can race
+                // here (the second removes the first's fresh lock). It needs
+                // a holder dead for LOCK_STALE and two takeovers within the
+                // same instant; an flock-based lock would close it.
                 if stale {
                     let _ = fs::remove_file(path);
                     continue;
@@ -1274,15 +1278,62 @@ fn canon(v: &TomlValue) -> String {
     }
 }
 
-fn rows_canon(doc: &DocumentMut, kind: &str) -> Option<String> {
-    let item = doc
-        .get("ui")
+fn rows_item<'a>(doc: &'a DocumentMut, kind: &str) -> Option<&'a Item> {
+    doc.get("ui")
         .and_then(Item::as_table_like)
         .and_then(|u| u.get("sidebar"))
         .and_then(Item::as_table_like)
         .and_then(|s| s.get(kind))
         .and_then(Item::as_table_like)
-        .and_then(|k| k.get("rows"))?;
+        .and_then(|k| k.get("rows"))
+}
+
+/// Whether `rows` have the shape `build_rows` has produced since 0.2.0, with
+/// any palettes and colours: `state_icon`, then only `$sc_*` token tables,
+/// then the fixed builtins. Rows carrying anything else are someone else's.
+fn looks_generated(rows: &Item, kind: &str) -> bool {
+    let builtin = |v: &TomlValue, name: &str| v.as_str() == Some(name);
+    let sc_token = |v: &TomlValue| {
+        v.as_inline_table().is_some_and(|t| {
+            t.len() == 3
+                && t.get("token")
+                    .and_then(TomlValue::as_str)
+                    .is_some_and(|s| s.starts_with(&format!("${TOKEN_PREFIX}")))
+                && t.get("fg")
+                    .and_then(TomlValue::as_str)
+                    .is_some_and(is_hex_colour)
+                && t.get("bold").and_then(TomlValue::as_bool) == Some(true)
+        })
+    };
+    let (tail, second): (&[&str], &[&str]) = if kind == "agents" {
+        (&["workspace", "tab"], &["agent"])
+    } else {
+        (&["workspace"], &["branch", "git_status"])
+    };
+    let Some(rows) = rows.as_array() else {
+        return false;
+    };
+    let rows: Vec<&TomlValue> = rows.iter().collect();
+    let [TomlValue::Array(first), TomlValue::Array(last)] = rows.as_slice() else {
+        return false;
+    };
+    let first: Vec<&TomlValue> = first.iter().collect();
+    let Some((head, rest)) = first.split_first() else {
+        return false;
+    };
+    let Some(split) = rest.len().checked_sub(tail.len()) else {
+        return false;
+    };
+    let (tokens, end) = rest.split_at(split);
+    builtin(head, "state_icon")
+        && tokens.iter().all(|v| sc_token(v))
+        && end.iter().zip(tail).all(|(v, n)| builtin(v, n))
+        && last.len() == second.len()
+        && last.iter().zip(second).all(|(v, n)| builtin(v, n))
+}
+
+fn rows_canon(doc: &DocumentMut, kind: &str) -> Option<String> {
+    let item = rows_item(doc, kind)?;
     Some(
         item.as_value()
             .map(canon)
@@ -1292,22 +1343,19 @@ fn rows_canon(doc: &DocumentMut, kind: &str) -> Option<String> {
 
 /// Splits the managed kinds into those whose rows are still exactly what this
 /// plugin wrote (or absent) and those someone else has replaced since. Rows
-/// recorded without a fingerprint count as ours only if they match what the
-/// plugin generates for one of `legacy`.
+/// recorded without a fingerprint (0.3.3 and earlier) count as ours when they
+/// have the generated shape, whatever palettes they were generated from.
 fn owned_sidebar(
     doc: &DocumentMut,
     managed: &BTreeMap<String, String>,
-    legacy: &[SidebarSpec],
 ) -> (Vec<String>, Vec<String>) {
     managed.keys().cloned().partition(|kind| {
-        let Some(current) = rows_canon(doc, kind) else {
+        let Some(item) = rows_item(doc, kind) else {
             return true;
         };
         match managed[kind].as_str() {
-            "" => legacy
-                .iter()
-                .any(|spec| canon(&TomlValue::Array(build_rows(spec, kind))) == current),
-            written => written == current,
+            "" => looks_generated(item, kind),
+            written => rows_canon(doc, kind).as_deref() == Some(written),
         }
     })
 }
@@ -1358,7 +1406,6 @@ struct Plan<'a> {
     previously_managed: &'a [String],
     sidebar: Option<&'a SidebarSpec>,
     managed_sidebar: &'a BTreeMap<String, String>,
-    legacy: &'a [SidebarSpec],
 }
 
 struct Planned {
@@ -1379,7 +1426,7 @@ fn plan_full(original: &str, plan: &Plan) -> Res<Planned> {
         Some(tokens) => apply_theme(&mut doc, tokens, plan.previously_managed)?,
         None => clear_theme(&mut doc, plan.previously_managed),
     }
-    let (owned, released) = owned_sidebar(&doc, plan.managed_sidebar, plan.legacy);
+    let (owned, released) = owned_sidebar(&doc, plan.managed_sidebar);
     let managed_sidebar = match plan.sidebar {
         Some(spec) => apply_sidebar(&mut doc, spec, &owned)?
             .into_iter()
@@ -1414,7 +1461,6 @@ fn plan_apply(original: &str, tokens: &Tokens, previously_managed: &[String]) ->
         previously_managed,
         sidebar: None,
         managed_sidebar: &BTreeMap::new(),
-        legacy: &[],
     };
     plan_full(original, &plan).map(|p| p.text)
 }
@@ -1423,14 +1469,12 @@ fn plan_clear(
     original: &str,
     managed: &[String],
     managed_sidebar: &BTreeMap<String, String>,
-    legacy: &[SidebarSpec],
 ) -> Res<Planned> {
     let plan = Plan {
         theme: None,
         previously_managed: managed,
         sidebar: None,
         managed_sidebar,
-        legacy,
     };
     plan_full(original, &plan)
 }
@@ -1634,22 +1678,15 @@ fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &SessionState) -> Res<()> {
 }
 
 fn sidebar_spec(cfg: &PluginConfig, light: bool) -> Option<SidebarSpec> {
-    cfg.sidebar.then(|| sidebar_rows_for(cfg, light))
-}
-
-fn sidebar_rows_for(cfg: &PluginConfig, light: bool) -> SidebarSpec {
+    if !cfg.sidebar {
+        return None;
+    }
     let colours = cfg
         .palettes
         .iter()
         .filter_map(|(n, p)| p.accent(light).map(|c| (n.clone(), c)))
         .collect();
-    SidebarSpec { colours }
-}
-
-/// What this plugin would write in either theme mode: the reference for rows
-/// recorded before fingerprints existed.
-fn legacy_specs(cfg: &PluginConfig) -> [SidebarSpec; 2] {
-    [sidebar_rows_for(cfg, false), sidebar_rows_for(cfg, true)]
+    Some(SidebarSpec { colours })
 }
 
 // --- commands -------------------------------------------------------------------
@@ -1680,7 +1717,6 @@ fn apply_shared(
         previously_managed: &st.managed,
         sidebar: spec.as_ref(),
         managed_sidebar: &st.managed_sidebar,
-        legacy: &legacy_specs(cfg),
     };
     let Planned {
         text: updated,
@@ -1694,19 +1730,49 @@ fn apply_shared(
     };
     commit(ctx, &path, &original, &updated, dry_run, &what)?;
 
-    if cfg.window_tint {
-        let target = palette_name.and_then(|n| cfg.palettes[n].window_bg(light));
-        for line in window::apply(&mut st.window, target.as_deref(), dry_run)? {
-            outln!("[{TAG}] {line}");
-        }
-    }
+    let managed = tokens
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+    let target = palette_name
+        .filter(|_| cfg.window_tint)
+        .and_then(|n| cfg.palettes[n].window_bg(light));
+    finish_apply(
+        &mut st,
+        managed,
+        managed_sidebar,
+        dry_run,
+        |st| save_state(ctx, st),
+        |w| {
+            if cfg.window_tint {
+                window::apply(w, target.as_deref(), dry_run)
+            } else {
+                Ok(Vec::new())
+            }
+        },
+    )
+}
 
+/// Records what `commit` just wrote and saves it before tinting the window.
+/// The fingerprint must reach disk before anything else can fail: a stale
+/// one would make the next apply see the plugin's own rows as foreign.
+fn finish_apply(
+    st: &mut State,
+    managed: Vec<String>,
+    managed_sidebar: BTreeMap<String, String>,
+    dry_run: bool,
+    mut save: impl FnMut(&State) -> Res<()>,
+    tint: impl FnOnce(&mut window::WindowState) -> Res<Vec<String>>,
+) -> Res<()> {
     if !dry_run {
-        st.managed = tokens
-            .map(|t| t.keys().cloned().collect())
-            .unwrap_or_default();
+        st.managed = managed;
         st.managed_sidebar = managed_sidebar;
-        save_state(ctx, &st)?;
+        save(st)?;
+    }
+    for line in tint(&mut st.window)? {
+        outln!("[{TAG}] {line}");
+    }
+    if !dry_run {
+        save(st)?;
     }
     Ok(())
 }
@@ -1784,12 +1850,7 @@ fn cmd_clear(dry_run: bool) -> Res<()> {
         let path = herdr_config_path(&cfg);
         let original =
             fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let planned = plan_clear(
-            &original,
-            &st.managed,
-            &st.managed_sidebar,
-            &legacy_specs(&cfg),
-        )?;
+        let planned = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
         report_released(&planned.released);
         commit(&ctx, &path, &original, &planned.text, dry_run, "clear")?;
         if !dry_run {
@@ -2601,7 +2662,7 @@ mod tests {
         };
         fs::write(
             state_path(&ctx),
-            r##"{"managed":["accent"],"managed_sidebar":["ui.sidebar.agents.rows"],
+            r##"{"managed":["accent"],"managed_sidebar":["agents","spaces"],
                 "ws_tokens":{"w1":"peach"},"pane_tokens":{"w1:p1":"peach"},
                 "last_workspace":"w1","window_original":{"ttys001":"#000000"}}"##,
         )
@@ -2609,10 +2670,11 @@ mod tests {
         let st = load_state(&ctx);
         assert_eq!(st.managed, vec!["accent"]);
         assert_eq!(
-            st.managed_sidebar
-                .get("ui.sidebar.agents.rows")
-                .map(String::as_str),
-            Some(""),
+            st.managed_sidebar,
+            BTreeMap::from([
+                ("agents".into(), String::new()),
+                ("spaces".into(), String::new())
+            ]),
             "a list from 0.3.3 means managed, fingerprint unknown"
         );
         assert_eq!(
@@ -2747,7 +2809,6 @@ command = \"herdr-layout-cycle.cycle-layout\"
             previously_managed: &[],
             sidebar: Some(&spec),
             managed_sidebar: &BTreeMap::new(),
-            legacy: &[],
         };
         let Planned {
             text: applied,
@@ -2769,7 +2830,7 @@ command = \"herdr-layout-cycle.cycle-layout\"
             applied.contains("agent_panel_sort = \"priority\""),
             "user's [ui] keys must survive"
         );
-        let cleared = plan_clear(&applied, &["accent".into()], &managed, &[]).unwrap();
+        let cleared = plan_clear(&applied, &["accent".into()], &managed).unwrap();
         assert_eq!(cleared.text, USER_CONFIG);
     }
 
@@ -2784,7 +2845,6 @@ command = \"herdr-layout-cycle.cycle-layout\"
             previously_managed: &[],
             sidebar: Some(&spec),
             managed_sidebar: &BTreeMap::new(),
-            legacy: &[],
         };
         let Planned {
             text: applied,
@@ -2800,7 +2860,7 @@ command = \"herdr-layout-cycle.cycle-layout\"
             applied.contains("rows = [[\"agent\"]]"),
             "user rows preserved verbatim"
         );
-        let cleared = plan_clear(&applied, &[], &managed, &[]).unwrap();
+        let cleared = plan_clear(&applied, &[], &managed).unwrap();
         assert_eq!(cleared.text, base);
     }
 
@@ -2819,7 +2879,6 @@ command = \"herdr-layout-cycle.cycle-layout\"
             previously_managed: &[],
             sidebar: Some(spec),
             managed_sidebar: managed,
-            legacy: std::slice::from_ref(spec),
         };
         plan_full(text, &plan).unwrap()
     }
@@ -2859,12 +2918,12 @@ command = \"herdr-layout-cycle.cycle-layout\"
         assert!(third.text.contains(CREW_ROWS));
 
         // Clear removes only the spaces rows.
-        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar, &[]).unwrap();
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
         assert!(cleared.text.contains(CREW_ROWS));
         assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
 
         // Clear straight after the replacement (no apply in between) also keeps them.
-        let cleared = plan_clear(&theirs, &[], &first.managed_sidebar, &[]).unwrap();
+        let cleared = plan_clear(&theirs, &[], &first.managed_sidebar).unwrap();
         assert_eq!(cleared.released, ["agents"]);
         assert!(cleared.text.contains(CREW_ROWS));
         assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
@@ -2883,27 +2942,94 @@ command = \"herdr-layout-cycle.cycle-layout\"
         let reformatted = second.text.replace(", ", ",  ");
         let third = apply_rows(&reformatted, &light, &second.managed_sidebar);
         assert!(third.released.is_empty());
-        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar, &[]).unwrap();
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
+        assert_eq!(cleared.text, USER_CONFIG);
+    }
+
+    fn legacy_managed() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("agents".to_string(), String::new()),
+            ("spaces".to_string(), String::new()),
+        ])
+    }
+
+    #[test]
+    fn rows_without_a_fingerprint_are_kept_by_shape_even_after_a_palette_edit() {
+        // Written by 0.3.3 from the old palettes; the config has changed since.
+        let old = spec_of(&[("red", "#f38ba8"), ("blue", "#89b4fa")]);
+        let ours = apply_rows(USER_CONFIG, &old, &BTreeMap::new()).text;
+        let edited = spec_of(&[("red", "#d20f39"), ("green", "#a6e3a1")]);
+        let kept = apply_rows(&ours, &edited, &legacy_managed());
+        assert!(kept.released.is_empty());
+        assert!(kept.managed_sidebar.values().all(|fp| !fp.is_empty()));
+        assert!(kept.text.contains("$sc_green") && !kept.text.contains("#89b4fa"));
+
+        // Clear straight from legacy state also removes them.
+        let cleared = plan_clear(&ours, &[], &legacy_managed()).unwrap();
+        assert!(cleared.released.is_empty());
         assert_eq!(cleared.text, USER_CONFIG);
     }
 
     #[test]
-    fn rows_without_a_fingerprint_are_kept_only_if_they_match_what_would_be_written() {
+    fn rows_without_a_fingerprint_are_released_when_they_carry_foreign_tokens() {
         let spec = spec_of(&[("red", "#f38ba8")]);
         let ours = apply_rows(USER_CONFIG, &spec, &BTreeMap::new()).text;
-        let legacy: BTreeMap<String, String> = [
-            ("agents".to_string(), String::new()),
-            ("spaces".to_string(), String::new()),
-        ]
-        .into();
-        let kept = apply_rows(&ours, &spec, &legacy);
-        assert!(kept.released.is_empty());
-        assert!(kept.managed_sidebar.values().all(|fp| !fp.is_empty()));
-
-        let theirs = ours.replacen("rows = [[\"state_icon\"", "rows = [[\"agent\"", 1);
-        let planned = apply_rows(&theirs, &spec, &legacy);
+        let theirs = ours.replacen(
+            "\"workspace\", \"tab\"]",
+            "\"$crew_top_peach\", \"workspace\", \"tab\"]",
+            1,
+        );
+        assert_ne!(theirs, ours);
+        let planned = apply_rows(&theirs, &spec, &legacy_managed());
         assert_eq!(planned.released, ["agents"]);
         assert_eq!(planned.text, theirs);
+        let cleared = plan_clear(&theirs, &[], &legacy_managed()).unwrap();
+        assert!(cleared.text.contains("$crew_top_peach"));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+
+        // Other shapes that are not ours.
+        let doc: DocumentMut = r##"
+rows = [["state_icon", { token = "$sc_red", fg = "#f38ba8", bold = true, italic = true }, "workspace", "tab"], ["agent"]]
+plain = [["agent"]]
+"##
+        .parse()
+        .unwrap();
+        assert!(!looks_generated(&doc["rows"], "agents"));
+        assert!(!looks_generated(&doc["plain"], "agents"));
+    }
+
+    #[test]
+    fn fingerprint_is_saved_before_a_failing_window_tint() {
+        let spec = spec_of(&[("red", "#f38ba8")]);
+        let first = apply_rows(USER_CONFIG, &spec, &BTreeMap::new());
+        let mut st = State {
+            managed_sidebar: first.managed_sidebar.clone(),
+            ..State::default()
+        };
+        // A palette change rewrites the rows; then the tint fails.
+        let light = spec_of(&[("red", "#d20f39")]);
+        let second = apply_rows(&first.text, &light, &st.managed_sidebar);
+        let mut saved = None;
+        let err = finish_apply(
+            &mut st,
+            vec!["accent".into()],
+            second.managed_sidebar.clone(),
+            false,
+            |s| {
+                saved = Some(s.managed_sidebar.clone());
+                Ok(())
+            },
+            |_| Err("osascript: not authorised".into()),
+        );
+        assert!(err.is_err());
+        let saved = saved.expect("state saved before the tint");
+        assert_eq!(saved, second.managed_sidebar);
+
+        // The next apply still owns its rows, and clear removes them.
+        let third = apply_rows(&second.text, &light, &saved);
+        assert!(third.released.is_empty());
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar).unwrap();
+        assert!(!cleared.text.contains("$sc_red"));
     }
 
     #[test]
@@ -2912,7 +3038,7 @@ command = \"herdr-layout-cycle.cycle-layout\"
             "{USER_CONFIG}\n[theme]\nname = \"catppuccin\"\n\n[theme.custom]\ntext = \"#ffffff\"\n"
         );
         let applied = plan_apply(&base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
-        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new(), &[])
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new())
             .unwrap()
             .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));
@@ -2924,7 +3050,7 @@ command = \"herdr-layout-cycle.cycle-layout\"
         let base = "[theme]\ncustom = { text = \"#ffffff\" }\n";
         let applied = plan_apply(base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
         assert!(applied.contains("accent = \"#f38ba8\"") && applied.contains("text = \"#ffffff\""));
-        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new(), &[])
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new())
             .unwrap()
             .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));

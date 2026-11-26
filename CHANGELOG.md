@@ -30,8 +30,12 @@ All notable changes to this project are documented here. The format follows
   by `clear`. The plugin now records a fingerprint of the rows it wrote; rows
   that no longer match are released with a one-time "rows were changed by
   someone else; leaving them alone" and never rewritten or removed. Rows
-  recorded by 0.3.3 without a fingerprint stay managed only if they equal
-  what the plugin would generate (dark or light). Pane and Space tokens are
+  recorded by 0.3.3 without a fingerprint stay managed when they have the
+  shape the plugin generates (`state_icon`, only `$sc_*` token tables, then
+  its fixed builtins), whatever palettes they came from; rows with any other
+  token, such as `$crew_top_*`, are released. The fingerprint is saved right
+  after the config write, before the window tint, so a failing tint cannot
+  leave the plugin's own rows looking foreign. Pane and Space tokens are
   still reported either way, so other rows can keep using `$sc_<palette>`.
 
 - herdr's config, the plugin config dir and the state dir now follow

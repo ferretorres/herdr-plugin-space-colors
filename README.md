@@ -262,7 +262,9 @@ each session apart, keyed by the session's socket (`HERDR_SOCKET_PATH`, which
 herdr sets for plugin commands; from a plain shell it is looked up through
 `HERDR_SESSION`, else the default session). Sidebar tags and pane tints are
 therefore correct in every session at once. `herdr-space-colors status`
-shows which session and state file a command used.
+shows which session and state file a command used. Per-session state files
+are small and never pruned; delete `state-*.json` for sessions you no longer
+use if you like (a missing file only costs one re-tag).
 
 The theme is the exception. It lives in the one `config.toml` every session
 reads, and herdr (up to 0.9.5) has no per-session or runtime theme call, so
