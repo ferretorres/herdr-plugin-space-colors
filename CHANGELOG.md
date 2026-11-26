@@ -34,6 +34,12 @@ All notable changes to this project are documented here. The format follows
   what the plugin would generate (dark or light). Pane and Space tokens are
   still reported either way, so other rows can keep using `$sc_<palette>`.
 
+- herdr's config, the plugin config dir and the state dir now follow
+  `XDG_CONFIG_HOME` / `XDG_STATE_HOME` like herdr does when no explicit path
+  is given. With only `XDG_CONFIG_HOME` set, `apply` failed reading
+  `~/.config/herdr/config.toml`, and the CLI looked for the plugin config
+  outside herdr's config dir. An empty XDG value counts as unset.
+
 ### Changed
 
 - `status` shows the session, its socket and its state file. `clear` drops

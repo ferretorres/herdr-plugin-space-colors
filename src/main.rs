@@ -182,7 +182,7 @@ Usage:
 
 Plugin config: $HERDR_PLUGIN_CONFIG_DIR/config.toml  (seeded on first run)
 Herdr config:  $HERDR_CONFIG_PATH, else `herdr_config` in the plugin config,
-               else ~/.config/herdr/config.toml
+               else ${{XDG_CONFIG_HOME:-~/.config}}/herdr/config.toml
 Backup:        <herdr config>{BACKUP_SUFFIX}, written once before the first edit
 ")
 }
@@ -207,14 +207,11 @@ fn ctx() -> Ctx {
     // where herdr keeps them so both paths agree.
     let config_dir = env::var_os("HERDR_PLUGIN_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config/herdr/plugins/config").join(PLUGIN_ID));
+        .unwrap_or_else(|| herdr_config_dir().join("plugins/config").join(PLUGIN_ID));
     // herdr keeps plugin state under the XDG state dir, not beside the config.
-    let state_root = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/state"));
     let state_dir = env::var_os("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| state_root.join("herdr/plugins").join(PLUGIN_ID));
+        .unwrap_or_else(|| herdr_state_dir().join("plugins").join(PLUGIN_ID));
     Ctx {
         herdr,
         config_dir,
@@ -229,7 +226,33 @@ fn herdr_config_path(cfg: &PluginConfig) -> PathBuf {
     if let Some(p) = &cfg.herdr_config {
         return expand_home(p);
     }
-    home().join(".config/herdr/config.toml")
+    herdr_config_dir().join("config.toml")
+}
+
+/// herdr's directory rule: `$XDG_*_HOME/herdr` when set, else
+/// `$HOME/<home_rel>/herdr`. An empty XDG value counts as unset, per the XDG
+/// spec (herdr itself would resolve it to a relative `herdr`).
+fn herdr_dir(xdg: Option<&std::ffi::OsStr>, home: &Path, home_rel: &str) -> PathBuf {
+    match xdg.filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base).join("herdr"),
+        None => home.join(home_rel).join("herdr"),
+    }
+}
+
+fn herdr_config_dir() -> PathBuf {
+    herdr_dir(
+        env::var_os("XDG_CONFIG_HOME").as_deref(),
+        &home(),
+        ".config",
+    )
+}
+
+fn herdr_state_dir() -> PathBuf {
+    herdr_dir(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        &home(),
+        ".local/state",
+    )
 }
 
 fn expand_home(p: &str) -> PathBuf {
@@ -2603,6 +2626,24 @@ mod tests {
         let text = fs::read_to_string(state_path(&ctx)).unwrap();
         assert!(!text.contains("ws_tokens") && !text.contains("pane_tokens"));
         assert!(text.contains("accent"));
+    }
+
+    #[test]
+    fn herdr_dirs_follow_xdg_like_herdr_and_fall_back_to_home() {
+        use std::ffi::OsStr;
+        let home = Path::new("/h");
+        assert_eq!(
+            herdr_dir(Some(OsStr::new("/x/cfg")), home, ".config"),
+            Path::new("/x/cfg/herdr")
+        );
+        assert_eq!(
+            herdr_dir(None, home, ".config"),
+            Path::new("/h/.config/herdr")
+        );
+        assert_eq!(
+            herdr_dir(Some(OsStr::new("")), home, ".local/state"),
+            Path::new("/h/.local/state/herdr")
+        );
     }
 
     #[test]
