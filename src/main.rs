@@ -558,7 +558,9 @@ fn is_hex_colour(s: &str) -> bool {
 #[derive(Default)]
 struct State {
     managed: Vec<String>,
-    managed_sidebar: Vec<String>,
+    /// Sidebar kind → canonical form of the rows last written there. An empty
+    /// fingerprint comes from a version that did not record one.
+    managed_sidebar: BTreeMap<String, String>,
     window: window::WindowState,
 }
 
@@ -686,7 +688,13 @@ fn load_state(ctx: &Ctx) -> State {
     };
     State {
         managed: str_vec(&v["managed"]),
-        managed_sidebar: str_vec(&v["managed_sidebar"]),
+        managed_sidebar: match v["sidebar_rows"].as_object() {
+            Some(_) => str_map(&v["sidebar_rows"]),
+            None => str_vec(&v["managed_sidebar"])
+                .into_iter()
+                .map(|k| (k, String::new()))
+                .collect(),
+        },
         window: window::WindowState {
             original: str_map(&v["window_original"]),
             current: str_map(&v["window_current"]),
@@ -704,7 +712,8 @@ fn write_state_file(dir: &Path, path: &Path, v: &Value) -> Res<()> {
 fn save_state(ctx: &Ctx, st: &State) -> Res<()> {
     let v = serde_json::json!({
         "managed": st.managed,
-        "managed_sidebar": st.managed_sidebar,
+        "sidebar_rows": st.managed_sidebar,
+        "managed_sidebar": st.managed_sidebar.keys().collect::<Vec<_>>(),
         "window_original": st.window.original,
         "window_current": st.window.current,
         "window_session": st.window.session,
@@ -1228,6 +1237,58 @@ fn apply_sidebar(
     Ok(managed)
 }
 
+/// Formatting-independent form of a TOML value, for comparing rows.
+fn canon(v: &TomlValue) -> String {
+    match v {
+        TomlValue::String(s) => format!("{:?}", s.value()),
+        TomlValue::Array(a) => format!("[{}]", a.iter().map(canon).collect::<Vec<_>>().join(",")),
+        TomlValue::InlineTable(t) => {
+            let mut kv: Vec<String> = t.iter().map(|(k, v)| format!("{k}={}", canon(v))).collect();
+            kv.sort();
+            format!("{{{}}}", kv.join(","))
+        }
+        other => other.clone().decorated("", "").to_string(),
+    }
+}
+
+fn rows_canon(doc: &DocumentMut, kind: &str) -> Option<String> {
+    let item = doc
+        .get("ui")
+        .and_then(Item::as_table_like)
+        .and_then(|u| u.get("sidebar"))
+        .and_then(Item::as_table_like)
+        .and_then(|s| s.get(kind))
+        .and_then(Item::as_table_like)
+        .and_then(|k| k.get("rows"))?;
+    Some(
+        item.as_value()
+            .map(canon)
+            .unwrap_or_else(|| item.to_string()),
+    )
+}
+
+/// Splits the managed kinds into those whose rows are still exactly what this
+/// plugin wrote (or absent) and those someone else has replaced since. Rows
+/// recorded without a fingerprint count as ours only if they match what the
+/// plugin generates for one of `legacy`.
+fn owned_sidebar(
+    doc: &DocumentMut,
+    managed: &BTreeMap<String, String>,
+    legacy: &[SidebarSpec],
+) -> (Vec<String>, Vec<String>) {
+    managed.keys().cloned().partition(|kind| {
+        let Some(current) = rows_canon(doc, kind) else {
+            return true;
+        };
+        match managed[kind].as_str() {
+            "" => legacy
+                .iter()
+                .any(|spec| canon(&TomlValue::Array(build_rows(spec, kind))) == current),
+            written => written == current,
+        }
+    })
+}
+
 fn clear_sidebar(doc: &mut DocumentMut, managed: &[String]) {
     for kind in managed {
         let Some(sidebar) = doc
@@ -1273,12 +1334,21 @@ struct Plan<'a> {
     theme: Option<&'a Tokens>,
     previously_managed: &'a [String],
     sidebar: Option<&'a SidebarSpec>,
-    managed_sidebar: &'a [String],
+    managed_sidebar: &'a BTreeMap<String, String>,
+    legacy: &'a [SidebarSpec],
+}
+
+struct Planned {
+    text: String,
+    managed_sidebar: BTreeMap<String, String>,
+    /// Kinds whose rows were changed by someone else and are no longer ours.
+    released: Vec<String>,
 }
 
 /// Full apply: theme tokens (or their removal when `theme` is None) plus
-/// sidebar rows. Returns the new text and the sidebar kinds now managed.
-fn plan_full(original: &str, plan: &Plan) -> Res<(String, Vec<String>)> {
+/// sidebar rows. Rows replaced by someone else since the last write are left
+/// alone and released.
+fn plan_full(original: &str, plan: &Plan) -> Res<Planned> {
     let mut doc: DocumentMut = original
         .parse()
         .map_err(|e| format!("herdr config parse error: {e}"))?;
@@ -1286,15 +1356,32 @@ fn plan_full(original: &str, plan: &Plan) -> Res<(String, Vec<String>)> {
         Some(tokens) => apply_theme(&mut doc, tokens, plan.previously_managed)?,
         None => clear_theme(&mut doc, plan.previously_managed),
     }
+    let (owned, released) = owned_sidebar(&doc, plan.managed_sidebar, plan.legacy);
     let managed_sidebar = match plan.sidebar {
-        Some(spec) => apply_sidebar(&mut doc, spec, plan.managed_sidebar)?,
+        Some(spec) => apply_sidebar(&mut doc, spec, &owned)?
+            .into_iter()
+            .map(|kind| {
+                let fp = rows_canon(&doc, &kind).unwrap_or_default();
+                (kind, fp)
+            })
+            .collect(),
         None => {
-            clear_sidebar(&mut doc, plan.managed_sidebar);
-            Vec::new()
+            clear_sidebar(&mut doc, &owned);
+            BTreeMap::new()
         }
     };
     tidy_theme(&mut doc);
-    Ok((doc.to_string(), managed_sidebar))
+    Ok(Planned {
+        text: doc.to_string(),
+        managed_sidebar,
+        released,
+    })
+}
+
+fn report_released(released: &[String]) {
+    for kind in released {
+        outln!("[{TAG}] sidebar {kind} rows were changed by someone else; leaving them alone");
+    }
 }
 
 #[cfg(test)]
@@ -1303,19 +1390,26 @@ fn plan_apply(original: &str, tokens: &Tokens, previously_managed: &[String]) ->
         theme: Some(tokens),
         previously_managed,
         sidebar: None,
-        managed_sidebar: &[],
+        managed_sidebar: &BTreeMap::new(),
+        legacy: &[],
     };
-    plan_full(original, &plan).map(|(s, _)| s)
+    plan_full(original, &plan).map(|p| p.text)
 }
 
-fn plan_clear(original: &str, managed: &[String], managed_sidebar: &[String]) -> Res<String> {
+fn plan_clear(
+    original: &str,
+    managed: &[String],
+    managed_sidebar: &BTreeMap<String, String>,
+    legacy: &[SidebarSpec],
+) -> Res<Planned> {
     let plan = Plan {
         theme: None,
         previously_managed: managed,
         sidebar: None,
         managed_sidebar,
+        legacy,
     };
-    plan_full(original, &plan).map(|(s, _)| s)
+    plan_full(original, &plan)
 }
 
 // --- commit ---------------------------------------------------------------------
@@ -1517,15 +1611,22 @@ fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &SessionState) -> Res<()> {
 }
 
 fn sidebar_spec(cfg: &PluginConfig, light: bool) -> Option<SidebarSpec> {
-    if !cfg.sidebar {
-        return None;
-    }
+    cfg.sidebar.then(|| sidebar_rows_for(cfg, light))
+}
+
+fn sidebar_rows_for(cfg: &PluginConfig, light: bool) -> SidebarSpec {
     let colours = cfg
         .palettes
         .iter()
         .filter_map(|(n, p)| p.accent(light).map(|c| (n.clone(), c)))
         .collect();
-    Some(SidebarSpec { colours })
+    SidebarSpec { colours }
+}
+
+/// What this plugin would write in either theme mode: the reference for rows
+/// recorded before fingerprints existed.
+fn legacy_specs(cfg: &PluginConfig) -> [SidebarSpec; 2] {
+    [sidebar_rows_for(cfg, false), sidebar_rows_for(cfg, true)]
 }
 
 // --- commands -------------------------------------------------------------------
@@ -1556,8 +1657,14 @@ fn apply_shared(
         previously_managed: &st.managed,
         sidebar: spec.as_ref(),
         managed_sidebar: &st.managed_sidebar,
+        legacy: &legacy_specs(cfg),
     };
-    let (updated, managed_sidebar) = plan_full(&original, &plan)?;
+    let Planned {
+        text: updated,
+        managed_sidebar,
+        released,
+    } = plan_full(&original, &plan)?;
+    report_released(&released);
     let what = match palette_name {
         Some(n) => format!("{} → {n} ({how})", ws.label),
         None => format!("{} → base theme ({how})", ws.label),
@@ -1654,8 +1761,14 @@ fn cmd_clear(dry_run: bool) -> Res<()> {
         let path = herdr_config_path(&cfg);
         let original =
             fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let updated = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
-        commit(&ctx, &path, &original, &updated, dry_run, "clear")?;
+        let planned = plan_clear(
+            &original,
+            &st.managed,
+            &st.managed_sidebar,
+            &legacy_specs(&cfg),
+        )?;
+        report_released(&planned.released);
+        commit(&ctx, &path, &original, &planned.text, dry_run, "clear")?;
         if !dry_run {
             for line in window::restore_all(&mut st.window)? {
                 outln!("[{TAG}] {line}");
@@ -1729,7 +1842,8 @@ fn cmd_status() -> Res<()> {
         } else if st.managed_sidebar.is_empty() {
             "not managed yet (or user-defined)".into()
         } else {
-            format!("managed: {}", st.managed_sidebar.join(", "))
+            let kinds: Vec<&str> = st.managed_sidebar.keys().map(String::as_str).collect();
+            format!("managed: {}", kinds.join(", "))
         }
     );
     outln!(
@@ -2471,7 +2585,13 @@ mod tests {
         .unwrap();
         let st = load_state(&ctx);
         assert_eq!(st.managed, vec!["accent"]);
-        assert_eq!(st.managed_sidebar, vec!["ui.sidebar.agents.rows"]);
+        assert_eq!(
+            st.managed_sidebar
+                .get("ui.sidebar.agents.rows")
+                .map(String::as_str),
+            Some(""),
+            "a list from 0.3.3 means managed, fingerprint unknown"
+        );
         assert_eq!(
             st.window.original.get("ttys001").map(String::as_str),
             Some("#000000")
@@ -2585,10 +2705,15 @@ command = \"herdr-layout-cycle.cycle-layout\"
             theme: Some(&p),
             previously_managed: &[],
             sidebar: Some(&spec),
-            managed_sidebar: &[],
+            managed_sidebar: &BTreeMap::new(),
+            legacy: &[],
         };
-        let (applied, managed) = plan_full(USER_CONFIG, &plan).unwrap();
-        assert_eq!(managed, vec!["agents".to_string(), "spaces".to_string()]);
+        let Planned {
+            text: applied,
+            managed_sidebar: managed,
+            ..
+        } = plan_full(USER_CONFIG, &plan).unwrap();
+        assert_eq!(managed.keys().collect::<Vec<_>>(), ["agents", "spaces"]);
         assert!(applied.contains("[ui.sidebar.agents]"), "{applied}");
         assert!(
             applied.contains("token = \"$sc_red\", fg = \"#f38ba8\", bold = true"),
@@ -2603,8 +2728,8 @@ command = \"herdr-layout-cycle.cycle-layout\"
             applied.contains("agent_panel_sort = \"priority\""),
             "user's [ui] keys must survive"
         );
-        let cleared = plan_clear(&applied, &["accent".into()], &managed).unwrap();
-        assert_eq!(cleared, USER_CONFIG);
+        let cleared = plan_clear(&applied, &["accent".into()], &managed, &[]).unwrap();
+        assert_eq!(cleared.text, USER_CONFIG);
     }
 
     #[test]
@@ -2617,20 +2742,127 @@ command = \"herdr-layout-cycle.cycle-layout\"
             theme: None,
             previously_managed: &[],
             sidebar: Some(&spec),
-            managed_sidebar: &[],
+            managed_sidebar: &BTreeMap::new(),
+            legacy: &[],
         };
-        let (applied, managed) = plan_full(&base, &plan).unwrap();
+        let Planned {
+            text: applied,
+            managed_sidebar: managed,
+            ..
+        } = plan_full(&base, &plan).unwrap();
         assert_eq!(
-            managed,
-            vec!["spaces".to_string()],
+            managed.keys().collect::<Vec<_>>(),
+            ["spaces"],
             "only the absent kind is managed"
         );
         assert!(
             applied.contains("rows = [[\"agent\"]]"),
             "user rows preserved verbatim"
         );
-        let cleared = plan_clear(&applied, &[], &managed).unwrap();
-        assert_eq!(cleared, base);
+        let cleared = plan_clear(&applied, &[], &managed, &[]).unwrap();
+        assert_eq!(cleared.text, base);
+    }
+
+    fn spec_of(pairs: &[(&str, &str)]) -> SidebarSpec {
+        SidebarSpec {
+            colours: pairs
+                .iter()
+                .map(|(n, c)| (n.to_string(), c.to_string()))
+                .collect(),
+        }
+    }
+
+    fn apply_rows(text: &str, spec: &SidebarSpec, managed: &BTreeMap<String, String>) -> Planned {
+        let plan = Plan {
+            theme: None,
+            previously_managed: &[],
+            sidebar: Some(spec),
+            managed_sidebar: managed,
+            legacy: std::slice::from_ref(spec),
+        };
+        plan_full(text, &plan).unwrap()
+    }
+
+    const CREW_ROWS: &str =
+        "rows = [[\"state_icon\", \"$crew_top_peach\", \"$crew_tab\"], [\"state_text\"]]";
+
+    #[test]
+    fn rows_replaced_after_a_write_survive_apply_focus_and_clear() {
+        let spec = spec_of(&[("red", "#f38ba8"), ("blue", "#89b4fa")]);
+        let first = apply_rows(USER_CONFIG, &spec, &BTreeMap::new());
+        assert_eq!(first.managed_sidebar.len(), 2);
+
+        // Another tool replaces the agents rows the plugin wrote.
+        let doc: DocumentMut = first.text.parse().unwrap();
+        let mut doc = doc;
+        doc["ui"]["sidebar"]["agents"]["rows"] = toml_edit::Item::None;
+        let theirs = doc.to_string().replace(
+            "[ui.sidebar.agents]\n",
+            &format!("[ui.sidebar.agents]\n{CREW_ROWS}\n"),
+        );
+        assert!(theirs.contains(CREW_ROWS), "{theirs}");
+
+        // Next focus: agents released and untouched, spaces still managed.
+        let second = apply_rows(&theirs, &spec, &first.managed_sidebar);
+        assert_eq!(second.released, ["agents"]);
+        assert_eq!(
+            second.managed_sidebar.keys().collect::<Vec<_>>(),
+            ["spaces"]
+        );
+        assert!(second.text.contains(CREW_ROWS));
+        assert_eq!(second.text, theirs);
+
+        // A later focus no longer considers them, and does not re-report.
+        let third = apply_rows(&second.text, &spec, &second.managed_sidebar);
+        assert!(third.released.is_empty());
+        assert!(third.text.contains(CREW_ROWS));
+
+        // Clear removes only the spaces rows.
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar, &[]).unwrap();
+        assert!(cleared.text.contains(CREW_ROWS));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+
+        // Clear straight after the replacement (no apply in between) also keeps them.
+        let cleared = plan_clear(&theirs, &[], &first.managed_sidebar, &[]).unwrap();
+        assert_eq!(cleared.released, ["agents"]);
+        assert!(cleared.text.contains(CREW_ROWS));
+        assert!(!cleared.text.contains("[ui.sidebar.spaces]"));
+    }
+
+    #[test]
+    fn untouched_managed_rows_still_follow_palette_changes() {
+        let dark = spec_of(&[("red", "#f38ba8")]);
+        let light = spec_of(&[("red", "#d20f39")]);
+        let first = apply_rows(USER_CONFIG, &dark, &BTreeMap::new());
+        let second = apply_rows(&first.text, &light, &first.managed_sidebar);
+        assert!(second.released.is_empty());
+        assert_eq!(second.managed_sidebar.len(), 2);
+        assert!(second.text.contains("#d20f39") && !second.text.contains("#f38ba8"));
+        // Reformatting the plugin's own rows does not count as a change.
+        let reformatted = second.text.replace(", ", ",  ");
+        let third = apply_rows(&reformatted, &light, &second.managed_sidebar);
+        assert!(third.released.is_empty());
+        let cleared = plan_clear(&third.text, &[], &third.managed_sidebar, &[]).unwrap();
+        assert_eq!(cleared.text, USER_CONFIG);
+    }
+
+    #[test]
+    fn rows_without_a_fingerprint_are_kept_only_if_they_match_what_would_be_written() {
+        let spec = spec_of(&[("red", "#f38ba8")]);
+        let ours = apply_rows(USER_CONFIG, &spec, &BTreeMap::new()).text;
+        let legacy: BTreeMap<String, String> = [
+            ("agents".to_string(), String::new()),
+            ("spaces".to_string(), String::new()),
+        ]
+        .into();
+        let kept = apply_rows(&ours, &spec, &legacy);
+        assert!(kept.released.is_empty());
+        assert!(kept.managed_sidebar.values().all(|fp| !fp.is_empty()));
+
+        let theirs = ours.replacen("rows = [[\"state_icon\"", "rows = [[\"agent\"", 1);
+        let planned = apply_rows(&theirs, &spec, &legacy);
+        assert_eq!(planned.released, ["agents"]);
+        assert_eq!(planned.text, theirs);
     }
 
     #[test]
@@ -2639,7 +2871,9 @@ command = \"herdr-layout-cycle.cycle-layout\"
             "{USER_CONFIG}\n[theme]\nname = \"catppuccin\"\n\n[theme.custom]\ntext = \"#ffffff\"\n"
         );
         let applied = plan_apply(&base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
-        let cleared = plan_clear(&applied, &["accent".into()], &[]).unwrap();
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new(), &[])
+            .unwrap()
+            .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));
         assert!(cleared.contains("[theme]\nname = \"catppuccin\""));
     }
@@ -2649,7 +2883,9 @@ command = \"herdr-layout-cycle.cycle-layout\"
         let base = "[theme]\ncustom = { text = \"#ffffff\" }\n";
         let applied = plan_apply(base, &tokens(&[("accent", "#f38ba8")]), &[]).unwrap();
         assert!(applied.contains("accent = \"#f38ba8\"") && applied.contains("text = \"#ffffff\""));
-        let cleared = plan_clear(&applied, &["accent".into()], &[]).unwrap();
+        let cleared = plan_clear(&applied, &["accent".into()], &BTreeMap::new(), &[])
+            .unwrap()
+            .text;
         assert!(cleared.contains("text = \"#ffffff\"") && !cleared.contains("accent"));
     }
 

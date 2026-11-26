@@ -221,7 +221,11 @@ The plugin writes to your herdr `config.toml`. The contract:
   formatting survive.
 - **Only its own keys.** Palette tokens under `[theme.custom]`, and the two
   sidebar `rows` keys — the latter only when you have not set them yourself.
-  It only ever removes what it wrote.
+  It only ever removes what it wrote. If you or another tool later replace
+  rows it wrote, it notices (it keeps a fingerprint of what it wrote), says
+  so once, and leaves those rows alone from then on, `clear` included. The
+  `$sc_<palette>` tokens are still reported on every pane and Space, so your
+  own rows can use them.
 - **Strict validation first.** Token allowlist and `#rgb`/`#rrggbb` colours.
   `herdr config check` accepts malformed colours, so the plugin checks itself.
 - **One-time backup** to `config.toml.space-colors.bak` before its first edit.

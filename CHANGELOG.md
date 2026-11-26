@@ -23,6 +23,16 @@ All notable changes to this project are documented here. The format follows
 - Sidebar tags come back after a server restart. herdr restores the same ids
   without their reported tokens, so the cache is now dropped when the
   session's server instance changes.
+- Sidebar rows replaced after the plugin wrote them are left alone. Once
+  written, `agents`/`spaces` rows were treated as the plugin's forever, so
+  rows set later by the user or another tool (for example a kit with its own
+  `[ui.sidebar.agents]` rows) were overwritten on the next focus and deleted
+  by `clear`. The plugin now records a fingerprint of the rows it wrote; rows
+  that no longer match are released with a one-time "rows were changed by
+  someone else; leaving them alone" and never rewritten or removed. Rows
+  recorded by 0.3.3 without a fingerprint stay managed only if they equal
+  what the plugin would generate (dark or light). Pane and Space tokens are
+  still reported either way, so other rows can keep using `$sc_<palette>`.
 
 ### Changed
 
