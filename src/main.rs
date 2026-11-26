@@ -28,7 +28,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 use toml_edit::{value, Array, DocumentMut, InlineTable, Item, Table, Value as TomlValue};
@@ -42,6 +42,8 @@ const TOKEN_PREFIX: &str = "sc_";
 const DEFAULT_CONFIG: &str = include_str!("../config.example.toml");
 const BACKUP_SUFFIX: &str = ".space-colors.bak";
 const LOCK_STALE: Duration = Duration::from_secs(15);
+/// How long a command waits for a lock held by another invocation.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 const HOOK_MARKER: &str = "# herdr-space-colors shell hook";
 
 /// `theme.custom.*` tokens accepted by herdr 0.8.2. `herdr config check` does
@@ -627,8 +629,9 @@ fn save_state(ctx: &Ctx, st: &State) -> Res<()> {
         .map_err(|e| format!("write state: {e}"))
 }
 
-/// One writer at a time. `workspace.focused` can fire in bursts; the second
-/// invocation must not race the first over config.toml.
+/// One writer at a time. `workspace.focused` can fire in bursts, and several
+/// herdr sessions start (and run their startup `apply`) at the same moment, so
+/// a second invocation waits for the first instead of racing it.
 struct Lock(PathBuf);
 
 impl Drop for Lock {
@@ -637,32 +640,43 @@ impl Drop for Lock {
     }
 }
 
-fn acquire_lock(ctx: &Ctx) -> Res<Option<Lock>> {
-    fs::create_dir_all(&ctx.state_dir)
-        .map_err(|e| format!("create {}: {e}", ctx.state_dir.display()))?;
-    let path = ctx.state_dir.join("apply.lock");
-    for _ in 0..2 {
+fn acquire_lock(dir: &Path, name: &str) -> Res<Option<Lock>> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    acquire_lock_at(&dir.join(name), LOCK_WAIT)
+}
+
+/// Take the lock file at `path`, retrying with backoff for up to `wait`.
+/// `None` means another holder kept it for the whole wait. A lock older than
+/// `LOCK_STALE` belongs to a process that died and is taken over.
+fn acquire_lock_at(path: &Path, wait: Duration) -> Res<Option<Lock>> {
+    let deadline = Instant::now() + wait;
+    let mut backoff = Duration::from_millis(20);
+    loop {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(path)
         {
-            Ok(_) => return Ok(Some(Lock(path))),
+            Ok(_) => return Ok(Some(Lock(path.to_owned()))),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
+                let stale = fs::metadata(path)
                     .and_then(|m| m.modified())
                     .map(|t| SystemTime::now().duration_since(t).unwrap_or_default() > LOCK_STALE)
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 if stale {
-                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_file(path);
                     continue;
                 }
-                return Ok(None);
             }
             Err(e) => return Err(format!("lock {}: {e}", path.display())),
         }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(backoff.min(deadline - now));
+        backoff = (backoff * 2).min(Duration::from_millis(250));
     }
-    Ok(None)
 }
 
 // --- herdr ----------------------------------------------------------------------
@@ -1409,8 +1423,8 @@ fn sidebar_spec(cfg: &PluginConfig, light: bool) -> Option<SidebarSpec> {
 fn cmd_apply(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        outln!("[{TAG}] another apply is running; skipped");
+    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
+        outln!("[{TAG}] another apply kept the lock past the wait; skipped");
         return Ok(());
     };
     let mut st = load_state(&ctx);
@@ -1474,8 +1488,8 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
 fn cmd_sweep(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        outln!("[{TAG}] another apply is running; skipped");
+    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
+        outln!("[{TAG}] another apply kept the lock past the wait; skipped");
         return Ok(());
     };
     let mut st = load_state(&ctx);
@@ -1490,8 +1504,8 @@ fn cmd_sweep(dry_run: bool) -> Res<()> {
 fn cmd_clear(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx)? else {
-        return Err("another apply is running; try again".into());
+    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
+        return Err("another apply kept the lock past the wait; try again".into());
     };
     let st = load_state(&ctx);
 
@@ -2123,6 +2137,50 @@ fn cmd_install_cli() -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("space-colors-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lock_contention_retries_then_proceeds() {
+        let dir = scratch_dir("lock-retry");
+        let path = dir.join("apply.lock");
+        let held = acquire_lock_at(&path, Duration::ZERO).unwrap().unwrap();
+        let start = Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let got = acquire_lock_at(&path, Duration::from_secs(3)).unwrap();
+        releaser.join().unwrap();
+        assert!(
+            got.is_some(),
+            "waiter must get the lock once it is released"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(start.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn lock_held_past_the_wait_gives_up_and_a_stale_lock_is_taken_over() {
+        let dir = scratch_dir("lock-timeout");
+        let path = dir.join("apply.lock");
+        let _held = acquire_lock_at(&path, Duration::ZERO).unwrap().unwrap();
+        let start = Instant::now();
+        assert!(acquire_lock_at(&path, Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+        assert!(start.elapsed() >= Duration::from_millis(200));
+
+        let stale = dir.join("stale.lock");
+        let f = fs::File::create(&stale).unwrap();
+        f.set_modified(SystemTime::now() - LOCK_STALE * 2).unwrap();
+        assert!(acquire_lock_at(&stale, Duration::ZERO).unwrap().is_some());
+    }
 
     #[test]
     fn manifest_lists_every_generated_palette_action() {
