@@ -23,7 +23,7 @@
 //!   * `herdr config check` after every write; failure restores the old bytes
 //!   * `clear` removes exactly what this plugin wrote and nothing else
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -553,19 +553,79 @@ fn is_hex_colour(s: &str) -> bool {
 
 // --- state ----------------------------------------------------------------------
 
+/// State tied to the shared herdr `config.toml` and to terminal windows. One
+/// copy for every session, guarded by `apply.lock`.
 #[derive(Default)]
 struct State {
     managed: Vec<String>,
     managed_sidebar: Vec<String>,
+    window: window::WindowState,
+}
+
+/// State keyed by herdr ids. Each session runs its own server with its own id
+/// space (`w1`, `w1:p1` exist in every session) while plugin state is shared,
+/// so these live in one file per session, guarded by that session's lock.
+#[derive(Default, Debug, PartialEq)]
+struct SessionState {
     pane_tokens: BTreeMap<String, String>,
     ws_tokens: BTreeMap<String, String>,
     last_workspace: Option<String>,
     last_palette: Option<String>,
-    window: window::WindowState,
+}
+
+/// The herdr server a command talks to.
+struct Session {
+    name: String,
+    socket: Option<String>,
+    key: String,
+}
+
+/// File-name-safe key for a session. The socket path identifies the server;
+/// the name is the fallback when no socket is known.
+fn session_key(socket: Option<&str>, name: &str) -> String {
+    let seed = match socket {
+        Some(s) => format!("socket:{s}"),
+        None => format!("session:{name}"),
+    };
+    format!("{:016x}", fnv1a(&seed))
+}
+
+/// herdr sets `HERDR_SOCKET_PATH` for plugin commands. From a plain shell the
+/// socket is looked up by session name, so the CLI and the hooks agree on the
+/// key.
+fn current_session(ctx: &Ctx) -> Session {
+    let name = window::current_session();
+    let socket = env::var("HERDR_SOCKET_PATH")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| lookup_socket(ctx, &name));
+    Session {
+        key: session_key(socket.as_deref(), &name),
+        name,
+        socket,
+    }
+}
+
+fn lookup_socket(ctx: &Ctx, name: &str) -> Option<String> {
+    let v = herdr_json(ctx, &["session", "list", "--json"]).ok()?;
+    v["sessions"]
+        .as_array()?
+        .iter()
+        .find(|s| s["name"].as_str() == Some(name))
+        .and_then(|s| s["socket_path"].as_str())
+        .map(str::to_owned)
 }
 
 fn state_path(ctx: &Ctx) -> PathBuf {
     ctx.state_dir.join("state.json")
+}
+
+fn session_state_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(format!("state-{key}.json"))
+}
+
+fn session_lock_name(key: &str) -> String {
+    format!("apply-{key}.lock")
 }
 
 fn str_vec(v: &Value) -> Vec<String> {
@@ -589,20 +649,20 @@ fn str_map(v: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+fn read_json(path: &Path) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Up to 0.3.3 `state.json` also held the id caches of whichever session wrote
+/// last. Those keys are ignored here and dropped on the next save; the cost is
+/// one redundant report per pane and Space on the first sweep.
 fn load_state(ctx: &Ctx) -> State {
-    let Ok(text) = fs::read_to_string(state_path(ctx)) else {
-        return State::default();
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+    let Some(v) = read_json(&state_path(ctx)) else {
         return State::default();
     };
     State {
         managed: str_vec(&v["managed"]),
         managed_sidebar: str_vec(&v["managed_sidebar"]),
-        pane_tokens: str_map(&v["pane_tokens"]),
-        ws_tokens: str_map(&v["ws_tokens"]),
-        last_workspace: v["last_workspace"].as_str().map(str::to_owned),
-        last_palette: v["last_palette"].as_str().map(str::to_owned),
         window: window::WindowState {
             original: str_map(&v["window_original"]),
             current: str_map(&v["window_current"]),
@@ -611,22 +671,45 @@ fn load_state(ctx: &Ctx) -> State {
     }
 }
 
+fn write_state_file(dir: &Path, path: &Path, v: &Value) -> Res<()> {
+    fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    fs::write(path, serde_json::to_string_pretty(v).unwrap())
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
 fn save_state(ctx: &Ctx, st: &State) -> Res<()> {
-    fs::create_dir_all(&ctx.state_dir)
-        .map_err(|e| format!("create {}: {e}", ctx.state_dir.display()))?;
     let v = serde_json::json!({
         "managed": st.managed,
         "managed_sidebar": st.managed_sidebar,
-        "pane_tokens": st.pane_tokens,
-        "ws_tokens": st.ws_tokens,
-        "last_workspace": st.last_workspace,
-        "last_palette": st.last_palette,
         "window_original": st.window.original,
         "window_current": st.window.current,
         "window_session": st.window.session,
     });
-    fs::write(state_path(ctx), serde_json::to_string_pretty(&v).unwrap())
-        .map_err(|e| format!("write state: {e}"))
+    write_state_file(&ctx.state_dir, &state_path(ctx), &v)
+}
+
+fn load_session_state(dir: &Path, key: &str) -> SessionState {
+    let Some(v) = read_json(&session_state_path(dir, key)) else {
+        return SessionState::default();
+    };
+    SessionState {
+        pane_tokens: str_map(&v["pane_tokens"]),
+        ws_tokens: str_map(&v["ws_tokens"]),
+        last_workspace: v["last_workspace"].as_str().map(str::to_owned),
+        last_palette: v["last_palette"].as_str().map(str::to_owned),
+    }
+}
+
+fn save_session_state(dir: &Path, session: &Session, st: &SessionState) -> Res<()> {
+    let v = serde_json::json!({
+        "session": session.name,
+        "socket": session.socket,
+        "pane_tokens": st.pane_tokens,
+        "ws_tokens": st.ws_tokens,
+        "last_workspace": st.last_workspace,
+        "last_palette": st.last_palette,
+    });
+    write_state_file(dir, &session_state_path(dir, &session.key), &v)
 }
 
 /// One writer at a time. `workspace.focused` can fire in bursts, and several
@@ -1338,60 +1421,55 @@ fn report_args<'a>(
     args
 }
 
+/// Entities whose wanted colour differs from what `cache` says is reported.
+/// Cache entries for ids that are no longer live are dropped first. The cache
+/// must belong to the session whose ids `want` holds.
+fn stale_tags(
+    cache: &mut BTreeMap<String, String>,
+    want: &BTreeMap<String, (Option<String>, Via)>,
+) -> Vec<(String, Option<String>)> {
+    cache.retain(|k, _| want.contains_key(k));
+    want.iter()
+        .filter(|(id, (palette, _))| {
+            cache.get(*id).map(String::as_str) != Some(palette.as_deref().unwrap_or_default())
+        })
+        .map(|(id, (palette, _))| (id.clone(), palette.clone()))
+        .collect()
+}
+
 /// Report one colour token per pane and workspace, clearing the others. Only
 /// entities whose colour changed since the last sweep cost a herdr call.
-fn sweep(ctx: &Ctx, cfg: &PluginConfig, st: &mut State, dry_run: bool) -> Res<usize> {
+fn sweep(ctx: &Ctx, cfg: &PluginConfig, st: &mut SessionState, dry_run: bool) -> Res<usize> {
     let workspaces = all_workspaces(ctx)?;
     let panes = all_panes(ctx)?;
     let a = assign(cfg, &workspaces, &panes);
     let all: Vec<String> = cfg.palettes.keys().cloned().collect();
     let mut calls = 0;
 
-    let live_ws: BTreeSet<&String> = a.ws_palette.keys().collect();
-    st.ws_tokens.retain(|k, _| live_ws.contains(k));
-    for (id, (palette, _)) in &a.ws_palette {
-        let want = palette.clone().unwrap_or_default();
-        if st.ws_tokens.get(id) == Some(&want) {
-            continue;
+    for (kind, cache, want) in [
+        ("workspace", &mut st.ws_tokens, &a.ws_palette),
+        ("pane", &mut st.pane_tokens, &a.pane_palette),
+    ] {
+        for (id, palette) in stale_tags(cache, want) {
+            let shown = palette.clone().unwrap_or_default();
+            if dry_run {
+                outln!(
+                    "[{TAG}] would tag {kind} {id} → {}",
+                    if shown.is_empty() { "none" } else { &shown }
+                );
+            } else {
+                let args = report_args(kind, &id, palette.as_deref(), &cfg.marker, &all);
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                herdr_run(ctx, &refs)?;
+                cache.insert(id, shown);
+            }
+            calls += 1;
         }
-        let args = report_args("workspace", id, palette.as_deref(), &cfg.marker, &all);
-        if dry_run {
-            outln!(
-                "[{TAG}] would tag workspace {id} → {}",
-                if want.is_empty() { "none" } else { &want }
-            );
-        } else {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            herdr_run(ctx, &refs)?;
-            st.ws_tokens.insert(id.clone(), want);
-        }
-        calls += 1;
-    }
-
-    let live_panes: BTreeSet<&String> = a.pane_palette.keys().collect();
-    st.pane_tokens.retain(|k, _| live_panes.contains(k));
-    for (id, (palette, _)) in &a.pane_palette {
-        let want = palette.clone().unwrap_or_default();
-        if st.pane_tokens.get(id) == Some(&want) {
-            continue;
-        }
-        let args = report_args("pane", id, palette.as_deref(), &cfg.marker, &all);
-        if dry_run {
-            outln!(
-                "[{TAG}] would tag pane {id} → {}",
-                if want.is_empty() { "none" } else { &want }
-            );
-        } else {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            herdr_run(ctx, &refs)?;
-            st.pane_tokens.insert(id.clone(), want);
-        }
-        calls += 1;
     }
     Ok(calls)
 }
 
-fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &State) -> Res<()> {
+fn clear_tags(ctx: &Ctx, cfg: &PluginConfig, st: &SessionState) -> Res<()> {
     let all: Vec<String> = cfg.palettes.keys().cloned().collect();
     for id in st.ws_tokens.keys() {
         let args = report_args("workspace", id, None, &cfg.marker, &all);
@@ -1420,25 +1498,18 @@ fn sidebar_spec(cfg: &PluginConfig, light: bool) -> Option<SidebarSpec> {
 
 // --- commands -------------------------------------------------------------------
 
-fn cmd_apply(dry_run: bool) -> Res<()> {
-    let ctx = ctx();
-    let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
-        outln!("[{TAG}] another apply kept the lock past the wait; skipped");
-        return Ok(());
-    };
-    let mut st = load_state(&ctx);
+/// Theme and window tint for `ws`. Caller holds `apply.lock`.
+fn apply_shared(
+    ctx: &Ctx,
+    cfg: &PluginConfig,
+    ws: &Workspace,
+    palette_name: Option<&str>,
+    how: &str,
+    dry_run: bool,
+) -> Res<()> {
+    let mut st = load_state(ctx);
 
-    let id = resolve_workspace_id(&ctx)?;
-    let ws = find_workspace(&ctx, &id)?;
-    let (palette_name, via) = choose_palette(&cfg, &ws);
-    let how = match via {
-        Via::Rule => "explicit rule",
-        Via::Auto => "auto",
-        _ => "no rule, auto off",
-    };
-
-    let path = herdr_config_path(&cfg);
+    let path = herdr_config_path(cfg);
     let original =
         fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let doc: DocumentMut = original
@@ -1447,7 +1518,7 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
     let light = theme_mode(&doc) == ThemeMode::Light;
 
     let tokens = palette_name.map(|n| cfg.palettes[n].effective(light));
-    let spec = sidebar_spec(&cfg, light);
+    let spec = sidebar_spec(cfg, light);
     let plan = Plan {
         theme: tokens.as_ref(),
         previously_managed: &st.managed,
@@ -1459,12 +1530,7 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
         Some(n) => format!("{} → {n} ({how})", ws.label),
         None => format!("{} → base theme ({how})", ws.label),
     };
-    commit(&ctx, &path, &original, &updated, dry_run, &what)?;
-
-    let tagged = sweep(&ctx, &cfg, &mut st, dry_run)?;
-    if tagged > 0 {
-        outln!("[{TAG}] sidebar tags: {tagged} updated");
-    }
+    commit(ctx, &path, &original, &updated, dry_run, &what)?;
 
     if cfg.window_tint {
         let target = palette_name.and_then(|n| cfg.palettes[n].window_bg(light));
@@ -1478,9 +1544,48 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
             .map(|t| t.keys().cloned().collect())
             .unwrap_or_default();
         st.managed_sidebar = managed_sidebar;
-        st.last_workspace = Some(ws.id);
-        st.last_palette = palette_name.map(str::to_owned);
-        save_state(&ctx, &st)?;
+        save_state(ctx, &st)?;
+    }
+    Ok(())
+}
+
+const LOCK_BUSY: &str = "another apply kept the lock past the wait";
+
+/// The theme lives in the shared `config.toml`, so its write is serialised
+/// across sessions by `apply.lock`; the sidebar tags are per session and only
+/// take that session's lock. The two are never held together.
+fn cmd_apply(dry_run: bool) -> Res<()> {
+    let ctx = ctx();
+    let cfg = load_plugin_config(&ctx)?;
+    let session = current_session(&ctx);
+
+    let id = resolve_workspace_id(&ctx)?;
+    let ws = find_workspace(&ctx, &id)?;
+    let (palette_name, via) = choose_palette(&cfg, &ws);
+    let how = match via {
+        Via::Rule => "explicit rule",
+        Via::Auto => "auto",
+        _ => "no rule, auto off",
+    };
+
+    match acquire_lock(&ctx.state_dir, "apply.lock")? {
+        Some(_lock) => apply_shared(&ctx, &cfg, &ws, palette_name, how, dry_run)?,
+        None => outln!("[{TAG}] {LOCK_BUSY}; theme skipped"),
+    }
+
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        outln!("[{TAG}] {LOCK_BUSY}; sidebar tags skipped");
+        return Ok(());
+    };
+    let mut sst = load_session_state(&ctx.state_dir, &session.key);
+    let tagged = sweep(&ctx, &cfg, &mut sst, dry_run)?;
+    if tagged > 0 {
+        outln!("[{TAG}] sidebar tags: {tagged} updated");
+    }
+    if !dry_run {
+        sst.last_workspace = Some(ws.id);
+        sst.last_palette = palette_name.map(str::to_owned);
+        save_session_state(&ctx.state_dir, &session, &sst)?;
     }
     Ok(())
 }
@@ -1488,47 +1593,59 @@ fn cmd_apply(dry_run: bool) -> Res<()> {
 fn cmd_sweep(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
-        outln!("[{TAG}] another apply kept the lock past the wait; skipped");
+    let session = current_session(&ctx);
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        outln!("[{TAG}] {LOCK_BUSY}; skipped");
         return Ok(());
     };
-    let mut st = load_state(&ctx);
+    let mut st = load_session_state(&ctx.state_dir, &session.key);
     let n = sweep(&ctx, &cfg, &mut st, dry_run)?;
     outln!("[{TAG}] sidebar tags: {n} updated");
     if !dry_run {
-        save_state(&ctx, &st)?;
+        save_session_state(&ctx.state_dir, &session, &st)?;
     }
     Ok(())
 }
 
+/// Restores the shared config and every tinted window, and drops the tags of
+/// the calling session. Other sessions keep their tags, which render nothing
+/// once the managed sidebar rows are gone, and their caches stay accurate.
 fn cmd_clear(dry_run: bool) -> Res<()> {
     let ctx = ctx();
     let cfg = load_plugin_config(&ctx)?;
-    let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
-        return Err("another apply kept the lock past the wait; try again".into());
+    let session = current_session(&ctx);
+    {
+        let Some(_lock) = acquire_lock(&ctx.state_dir, "apply.lock")? else {
+            return Err(format!("{LOCK_BUSY}; try again"));
+        };
+        let mut st = load_state(&ctx);
+        let path = herdr_config_path(&cfg);
+        let original =
+            fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let updated = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
+        commit(&ctx, &path, &original, &updated, dry_run, "clear")?;
+        if !dry_run {
+            for line in window::restore_all(&mut st.window)? {
+                outln!("[{TAG}] {line}");
+            }
+            save_state(&ctx, &State::default())?;
+        }
+    }
+
+    let Some(_lock) = acquire_lock(&ctx.state_dir, &session_lock_name(&session.key))? else {
+        return Err(format!("{LOCK_BUSY}; try again"));
     };
-    let st = load_state(&ctx);
-
-    let path = herdr_config_path(&cfg);
-    let original =
-        fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let updated = plan_clear(&original, &st.managed, &st.managed_sidebar)?;
-    commit(&ctx, &path, &original, &updated, dry_run, "clear")?;
-
+    let sst = load_session_state(&ctx.state_dir, &session.key);
     if dry_run {
         outln!(
             "[{TAG}] clear: would drop tags on {} workspaces and {} panes",
-            st.ws_tokens.len(),
-            st.pane_tokens.len()
+            sst.ws_tokens.len(),
+            sst.pane_tokens.len()
         );
         return Ok(());
     }
-    clear_tags(&ctx, &cfg, &st)?;
-    let mut st = st;
-    for line in window::restore_all(&mut st.window)? {
-        outln!("[{TAG}] {line}");
-    }
-    save_state(&ctx, &State::default())?;
+    clear_tags(&ctx, &cfg, &sst)?;
+    save_session_state(&ctx.state_dir, &session, &SessionState::default())?;
     Ok(())
 }
 
@@ -1543,7 +1660,17 @@ fn cmd_status() -> Res<()> {
         .map(|d| theme_mode(&d));
 
     outln!("herdr config:  {}", path.display());
+    let session = current_session(&ctx);
     outln!("state:         {}", state_path(&ctx).display());
+    outln!(
+        "session:       {} ({})",
+        session.name,
+        session.socket.as_deref().unwrap_or("socket unknown")
+    );
+    outln!(
+        "session state: {}",
+        session_state_path(&ctx.state_dir, &session.key).display()
+    );
     outln!(
         "theme mode:    {}",
         match mode {
@@ -2180,6 +2307,130 @@ mod tests {
         let f = fs::File::create(&stale).unwrap();
         f.set_modified(SystemTime::now() - LOCK_STALE * 2).unwrap();
         assert!(acquire_lock_at(&stale, Duration::ZERO).unwrap().is_some());
+    }
+
+    fn session(socket: &str) -> Session {
+        Session {
+            name: "test".into(),
+            socket: Some(socket.into()),
+            key: session_key(Some(socket), "test"),
+        }
+    }
+
+    fn want(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, (Option<String>, Via)> {
+        pairs
+            .iter()
+            .map(|(id, p)| (id.to_string(), (p.map(str::to_owned), Via::Auto)))
+            .collect()
+    }
+
+    /// What a successful sweep records: every reported tag lands in the cache.
+    fn record(st: &mut SessionState, w: &BTreeMap<String, (Option<String>, Via)>) {
+        for (id, palette) in stale_tags(&mut st.ws_tokens, w) {
+            st.ws_tokens.insert(id, palette.unwrap_or_default());
+        }
+    }
+
+    #[test]
+    fn session_key_follows_the_socket_and_falls_back_to_the_name() {
+        let a = session_key(Some("/h/.config/herdr/herdr.sock"), "default");
+        let b = session_key(Some("/h/.config/herdr/sessions/two/herdr.sock"), "two");
+        assert_ne!(a, b);
+        assert_eq!(a, session_key(Some("/h/.config/herdr/herdr.sock"), "other"));
+        assert_ne!(session_key(None, "two"), session_key(None, "default"));
+        assert_ne!(session_key(None, "two"), b);
+        assert!(a.len() == 16 && a.bytes().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sessions_with_overlapping_ids_keep_independent_caches() {
+        let dir = scratch_dir("sessions-independent");
+        let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
+        let mut sa = SessionState::default();
+        sa.ws_tokens.insert("w1".into(), "peach".into());
+        sa.pane_tokens.insert("w1:p1".into(), "peach".into());
+        let mut sb = SessionState::default();
+        sb.ws_tokens.insert("w1".into(), "blue".into());
+        sb.pane_tokens.insert("w1:p1".into(), "teal".into());
+        save_session_state(&dir, &a, &sa).unwrap();
+        save_session_state(&dir, &b, &sb).unwrap();
+        assert_eq!(load_session_state(&dir, &a.key), sa);
+        assert_eq!(load_session_state(&dir, &b.key), sb);
+    }
+
+    #[test]
+    fn a_sweep_in_one_session_does_not_suppress_tags_in_another() {
+        let dir = scratch_dir("sessions-sweep");
+        let (a, b) = (session("/s/a.sock"), session("/s/b.sock"));
+
+        // B tagged w3 earlier; A has no w3 at all.
+        let mut sb = SessionState::default();
+        record(&mut sb, &want(&[("w3", Some("mauve"))]));
+        save_session_state(&dir, &b, &sb).unwrap();
+
+        // A sweeps its own w1 → peach (and retains only its live ids).
+        let mut sa = load_session_state(&dir, &a.key);
+        record(&mut sa, &want(&[("w1", Some("peach"))]));
+        save_session_state(&dir, &a, &sa).unwrap();
+
+        // B's w1 also wants peach but was never tagged in B: it must be reported,
+        // and B's w3 survives A's retain.
+        let mut sb = load_session_state(&dir, &b.key);
+        let stale = stale_tags(
+            &mut sb.ws_tokens,
+            &want(&[("w1", Some("peach")), ("w3", Some("mauve"))]),
+        );
+        assert_eq!(stale, vec![("w1".to_string(), Some("peach".to_string()))]);
+        assert_eq!(sb.ws_tokens.get("w3").map(String::as_str), Some("mauve"));
+    }
+
+    #[test]
+    fn stale_tags_skips_what_is_in_place_and_drops_dead_ids() {
+        let mut cache: BTreeMap<String, String> = [
+            ("w1".to_string(), "peach".to_string()),
+            ("w2".to_string(), String::new()),
+            ("w9".to_string(), "red".to_string()),
+        ]
+        .into();
+        let stale = stale_tags(
+            &mut cache,
+            &want(&[("w1", Some("peach")), ("w2", None), ("w3", None)]),
+        );
+        assert_eq!(stale, vec![("w3".to_string(), None)]);
+        assert!(!cache.contains_key("w9"));
+    }
+
+    #[test]
+    fn legacy_shared_caches_are_ignored_and_dropped_on_save() {
+        let dir = scratch_dir("legacy-state");
+        let ctx = Ctx {
+            herdr: "herdr".into(),
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+        };
+        fs::write(
+            state_path(&ctx),
+            r##"{"managed":["accent"],"managed_sidebar":["ui.sidebar.agents.rows"],
+                "ws_tokens":{"w1":"peach"},"pane_tokens":{"w1:p1":"peach"},
+                "last_workspace":"w1","window_original":{"ttys001":"#000000"}}"##,
+        )
+        .unwrap();
+        let st = load_state(&ctx);
+        assert_eq!(st.managed, vec!["accent"]);
+        assert_eq!(st.managed_sidebar, vec!["ui.sidebar.agents.rows"]);
+        assert_eq!(
+            st.window.original.get("ttys001").map(String::as_str),
+            Some("#000000")
+        );
+        assert_eq!(
+            load_session_state(&dir, &session("/s/a.sock").key),
+            SessionState::default()
+        );
+
+        save_state(&ctx, &st).unwrap();
+        let text = fs::read_to_string(state_path(&ctx)).unwrap();
+        assert!(!text.contains("ws_tokens") && !text.contains("pane_tokens"));
+        assert!(text.contains("accent"));
     }
 
     #[test]
